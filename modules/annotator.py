@@ -6,30 +6,25 @@
 #   "manual" — проверка состояния разметки: выводит список кадров,
 #              для которых файл аннотации ещё не создан.
 #
-# Публичный интерфейс: функция annotate().
+# Публичный интерфейс: функции annotate() и run_interactive().
+# Обе принимают объект Project — пути берутся из него, а не из config.
 
 from pathlib import Path
 
-import config  # Централизованные настройки и пути проекта
 from modules.logger import get_logger
+from modules.project import Project
 
 logger = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Таблица источников: имя источника → папка с кадрами
-# ---------------------------------------------------------------------------
-
-SOURCES = {
-    "real": config.FRAMES_REAL_DIR,
-    "airsim": config.FRAMES_AIRSIM_DIR,
-}
+# Допустимые источники кадров (порядок фиксирован для меню выбора)
+_VALID_SOURCES = ("real", "airsim")
 
 # Допустимые расширения изображений при поиске кадров
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
 
 # ---------------------------------------------------------------------------
-# Вспомогательные функции
+# Вспомогательная утилита: путь к файлу аннотации
 # ---------------------------------------------------------------------------
 
 def _annotation_path(frame_path: Path, ann_dir: Path) -> Path:
@@ -47,30 +42,40 @@ def _annotation_path(frame_path: Path, ann_dir: Path) -> Path:
     return ann_dir / (frame_path.stem + ".txt")
 
 
-def _collect_frames(sources: list) -> list:
-    """Собирает все кадры из указанных источников.
+# ---------------------------------------------------------------------------
+# Вспомогательная функция: сбор кадров из источников проекта
+# ---------------------------------------------------------------------------
+
+def _collect_frames(project: Project, sources: list) -> list:
+    """Собирает все кадры из указанных источников проекта.
 
     Для каждого кадра возвращает пару (путь_к_кадру, папка_аннотаций).
-    Папка аннотаций зеркалирует структуру папки кадров:
-        data/processed/frames/real/  →  data/processed/annotations/real/
+    Папка аннотаций формируется как project.annotations_dir / source.
 
     Args:
+        project: объект Project — определяет пути к кадрам и аннотациям.
         sources: список имён источников ("real", "airsim").
 
     Returns:
         Список пар (frame_path, ann_dir).
     """
+    # Маппинг: имя источника → папка с кадрами проекта
+    frames_map = {
+        "real":   project.frames_real_dir,
+        "airsim": project.frames_airsim_dir,
+    }
+
     result = []
 
     for source in sources:
-        if source not in SOURCES:
+        if source not in frames_map:
             logger.warning(
                 f"Неизвестный источник '{source}', пропускаем. "
-                f"Допустимые: {list(SOURCES)}"
+                f"Допустимые: {list(frames_map)}"
             )
             continue
 
-        frames_dir = SOURCES[source]
+        frames_dir = frames_map[source]
 
         if not frames_dir.exists():
             logger.warning(
@@ -79,8 +84,8 @@ def _collect_frames(sources: list) -> list:
             )
             continue
 
-        # Создаём папку аннотаций для данного источника
-        ann_dir = config.ANNOTATIONS_DIR / source
+        # Создаём папку аннотаций для данного источника внутри проекта
+        ann_dir = project.annotations_dir / source
         ann_dir.mkdir(parents=True, exist_ok=True)
 
         # Собираем изображения в алфавитном порядке для воспроизводимости
@@ -174,9 +179,9 @@ def _run_auto(frames: list, model_path: str, conf: float, overwrite: bool) -> di
         logger.info(f"[{i}/{total}] {frame_path.name} → найдено объектов: {n_objects}")
 
     return {
-        "annotated": annotated,
-        "skipped": skipped,
-        "total_objects": total_objects,
+        "annotated":      annotated,
+        "skipped":        skipped,
+        "total_objects":  total_objects,
     }
 
 
@@ -215,8 +220,8 @@ def _run_manual(frames: list) -> dict:
         logger.info("Все кадры уже размечены.")
 
     return {
-        "annotated": annotated,
-        "unannotated": len(unannotated),
+        "annotated":        annotated,
+        "unannotated":      len(unannotated),
         "unannotated_files": [str(p) for p in unannotated],
     }
 
@@ -225,10 +230,11 @@ def _run_manual(frames: list) -> dict:
 # Интерактивный режим: вспомогательные функции
 # ---------------------------------------------------------------------------
 
-def _count_stats(sources_list: list) -> dict:
-    """Подсчитывает кадры и аннотации для каждого источника.
+def _count_stats(project: Project, sources_list: list) -> dict:
+    """Подсчитывает кадры и аннотации для каждого источника проекта.
 
     Args:
+        project:      объект Project — определяет пути к кадрам и аннотациям.
         sources_list: список имён источников для проверки.
 
     Returns:
@@ -238,15 +244,20 @@ def _count_stats(sources_list: list) -> dict:
           "airsim": {"frames": 250,  "annotated": 250, "unannotated": 0},
         }
     """
+    frames_map = {
+        "real":   project.frames_real_dir,
+        "airsim": project.frames_airsim_dir,
+    }
+
     result = {}
     for source in sources_list:
-        frames_dir = SOURCES.get(source)
+        frames_dir = frames_map.get(source)
         if not frames_dir or not frames_dir.exists():
             result[source] = {"frames": 0, "annotated": 0, "unannotated": 0}
             continue
 
         frames = [p for p in frames_dir.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS]
-        ann_dir = config.ANNOTATIONS_DIR / source
+        ann_dir = project.annotations_dir / source
         annotated = sum(1 for f in frames if (ann_dir / (f.stem + ".txt")).exists())
 
         result[source] = {
@@ -343,25 +354,32 @@ def _ask_overwrite(annotated_count: int, total_count: int) -> bool:
         print("  Введите 1 или 2.")
 
 
-def run_interactive(model_path: str = "yolov8n.pt", conf: float = 0.25) -> dict:
+def run_interactive(
+    project: Project,
+    model_path: str = "yolov8n.pt",
+    conf: float = 0.25,
+) -> dict:
     """Интерактивный запуск аннотатора с выбором источника, режима и политики перезаписи.
 
     Последовательно задаёт пользователю вопросы и вызывает annotate()
-    с собранными параметрами. Существующий API annotate() не затронут.
+    с собранными параметрами.
 
     Args:
+        project:    объект Project — определяет пути к кадрам и аннотациям.
         model_path: модель YOLOv8 (используется только в режиме auto).
         conf:       порог уверенности (только для auto).
 
     Returns:
         Словарь со статистикой от annotate().
     """
-    all_sources = list(SOURCES.keys())
-    stats = _count_stats(all_sources)
+    # Подключаем проектный лог до любых обращений к logger
+    get_logger(__name__, project.logs_dir)
+
+    stats = _count_stats(project, list(_VALID_SOURCES))
 
     # --- Шаг 1: общая статистика ---
-    total_frames     = sum(v["frames"]      for v in stats.values())
-    total_annotated  = sum(v["annotated"]   for v in stats.values())
+    total_frames      = sum(v["frames"]      for v in stats.values())
+    total_annotated   = sum(v["annotated"]   for v in stats.values())
     total_unannotated = sum(v["unannotated"] for v in stats.values())
 
     print(f"\nНайдено кадров: {total_frames}")
@@ -385,13 +403,13 @@ def run_interactive(model_path: str = "yolov8n.pt", conf: float = 0.25) -> dict:
     # --- Шаг 4: политика перезаписи (только для auto) ---
     overwrite = False
     if mode == "auto":
-        already = sum(stats[s]["annotated"] for s in selected_sources)
-        total_sel = sum(stats[s]["frames"]  for s in selected_sources)
+        already    = sum(stats[s]["annotated"] for s in selected_sources)
+        total_sel  = sum(stats[s]["frames"]    for s in selected_sources)
         if already > 0:
             overwrite = _ask_overwrite(already, total_sel)
 
-    return annotate(mode=mode, model_path=model_path, conf=conf,
-                    sources=selected_sources, overwrite=overwrite)
+    return annotate(project, mode=mode, model_path=model_path,
+                    conf=conf, sources=selected_sources, overwrite=overwrite)
 
 
 # ---------------------------------------------------------------------------
@@ -399,20 +417,21 @@ def run_interactive(model_path: str = "yolov8n.pt", conf: float = 0.25) -> dict:
 # ---------------------------------------------------------------------------
 
 def annotate(
+    project: Project,
     mode: str = "auto",
     model_path: str = "yolov8n.pt",
     conf: float = 0.25,
     sources: list = None,
     overwrite: bool = False,
 ) -> dict:
-    """Запускает разметку кадров в выбранном режиме.
+    """Запускает разметку кадров проекта в выбранном режиме.
 
     Args:
+        project:    объект Project — определяет пути к кадрам и аннотациям.
         mode:       режим работы — "auto" (авторазметка) или "manual" (проверка).
         model_path: путь к файлу весов YOLOv8 или имя предобученной модели
                     ("yolov8n.pt", "yolov8s.pt" и т.д.). Только для "auto".
-        conf:       порог уверенности от 0.0 до 1.0. Детекции ниже порога
-                    отбрасываются. Только для режима "auto".
+        conf:       порог уверенности от 0.0 до 1.0. Только для режима "auto".
         sources:    список источников для обработки. По умолчанию — все
                     (["real", "airsim"]).
         overwrite:  если True, перезаписывать существующие аннотации.
@@ -426,29 +445,31 @@ def annotate(
     Raises:
         ValueError:  если передан неизвестный режим.
         ImportError: если ultralytics не установлен (только в режиме "auto").
-
-    Пример использования:
-        >>> from modules.annotator import annotate
-        >>> stats = annotate(mode="auto", model_path="yolov8n.pt", conf=0.3)
-        >>> print(stats)  # {"annotated": 120, "skipped": 0, "total_objects": 347}
     """
+    # Подключаем файловый лог проекта — все записи logger в этом модуле
+    # (включая вызовы из _collect_frames, _run_auto, _run_manual) попадут
+    # в project.logs_dir/annotator.log
+    get_logger(__name__, project.logs_dir)
+
     if mode not in ("auto", "manual"):
         raise ValueError(
             f"Неизвестный режим '{mode}'. Допустимые значения: 'auto', 'manual'"
         )
 
-    # По умолчанию обрабатываем все зарегистрированные источники
+    # По умолчанию обрабатываем все источники
     if sources is None:
-        sources = list(SOURCES.keys())
+        sources = list(_VALID_SOURCES)
 
     logger.info("=" * 50)
-    logger.info(f"Annotator | режим={mode} | источники={sources}")
+    logger.info(
+        f"Annotator | project={project.name} | режим={mode} | источники={sources}"
+    )
     if mode == "auto":
         logger.info(f"Модель: {model_path} | conf={conf} | перезапись={overwrite}")
     logger.info("=" * 50)
 
     # Собираем полный список кадров из всех выбранных источников
-    frames = _collect_frames(sources)
+    frames = _collect_frames(project, sources)
 
     if not frames:
         logger.warning("Кадры для разметки не найдены. Проверьте папки источников.")
@@ -458,18 +479,22 @@ def annotate(
 
     # Запускаем нужный режим
     if mode == "auto":
-        stats = _run_auto(frames, model_path, conf, overwrite)
+        result = _run_auto(frames, model_path, conf, overwrite)
     else:
-        stats = _run_manual(frames)
+        result = _run_manual(frames)
 
     # Итоговый отчёт
     logger.info("=" * 50)
     logger.info("ИТОГОВЫЙ ОТЧЁТ:")
-    for key, value in stats.items():
+    for key, value in result.items():
         # Список файлов уже был выведен построчно в _run_manual
         if key != "unannotated_files":
             logger.info(f"  {key}: {value}")
-    logger.info(f"Папка аннотаций: {config.ANNOTATIONS_DIR}")
+    logger.info(f"Папка аннотаций: {project.annotations_dir}")
     logger.info("=" * 50)
 
-    return stats
+    # Обновляем метаданные проекта
+    project.update_step("annotate")
+    project.update_stats({"annotated": result.get("annotated", 0)})
+
+    return result

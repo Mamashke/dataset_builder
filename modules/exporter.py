@@ -15,6 +15,7 @@ import numpy as np
 
 import config
 from modules.logger import get_logger
+from modules.project import Project
 
 logger = get_logger(__name__)
 
@@ -32,19 +33,21 @@ def _imread(path: Path) -> Optional[np.ndarray]:
 # Экспорт в формат YOLO
 # ---------------------------------------------------------------------------
 
-def export_yolo() -> dict:
+def export_yolo(images_dir: Path, out_dir: Path) -> dict:
     """Создаёт data.yaml для обучения YOLO-моделей.
 
-    Файл указывает на папки images/ и labels/ существующего датасета.
+    Файл указывает на папку images/ существующего датасета проекта.
     Файлы изображений не копируются.
+
+    Args:
+        images_dir: папка с изображениями датасета (project.dataset_images_dir).
+        out_dir:    куда записать data.yaml (project.export_dir / "yolo").
 
     Returns:
         {"yaml_path": str, "images": int}
     """
-    out_dir = config.EXPORT_DIR / "yolo"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    images_dir = config.DATASET_IMAGES_DIR
     images_count = len(list(images_dir.glob("*.jpg"))) + \
                    len(list(images_dir.glob("*.jpeg"))) + \
                    len(list(images_dir.glob("*.png")))
@@ -52,7 +55,7 @@ def export_yolo() -> dict:
     # data.yaml в формате, который принимает YOLOv8/YOLOv5
     yaml_path = out_dir / "data.yaml"
     yaml_content = (
-        f"path: {config.DATASET_IMAGES_DIR.parent.as_posix()}\n"
+        f"path: {images_dir.parent.as_posix()}\n"
         f"train: images\n"
         f"val: images\n"
         f"\n"
@@ -71,21 +74,22 @@ def export_yolo() -> dict:
 # Экспорт в формат COCO
 # ---------------------------------------------------------------------------
 
-def export_coco() -> dict:
+def export_coco(images_dir: Path, labels_dir: Path, out_dir: Path) -> dict:
     """Создаёт annotations.json в формате COCO Detection.
 
-    Читает изображения из dataset/images/ и разметку из dataset/labels/.
+    Читает изображения и разметку из папок датасета проекта.
     Конвертирует bbox из YOLO [x_c, y_c, w, h] (нормализованный)
     в COCO [x_min, y_min, w_px, h_px] (абсолютный).
+
+    Args:
+        images_dir: папка с изображениями датасета (project.dataset_images_dir).
+        labels_dir: папка с метками датасета (project.dataset_labels_dir).
+        out_dir:    куда записать annotations.json (project.export_dir / "coco").
 
     Returns:
         {"json_path": str, "images": int, "annotations": int}
     """
-    out_dir = config.EXPORT_DIR / "coco"
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    images_dir  = config.DATASET_IMAGES_DIR
-    labels_dir  = config.DATASET_LABELS_DIR
 
     # Собираем все изображения, сортируем для воспроизводимости
     image_paths = sorted(
@@ -184,12 +188,13 @@ def export_coco() -> dict:
 # Главная функция
 # ---------------------------------------------------------------------------
 
-def export(format: str = "yolo") -> dict:
-    """Экспортирует финальный датасет в указанный формат.
+def export(project: Project, format: str = "yolo") -> dict:
+    """Экспортирует финальный датасет проекта в указанный формат.
 
     Args:
-        format: "yolo" — создаёт export/yolo/data.yaml
-                "coco" — создаёт export/coco/annotations.json
+        project: объект Project — определяет пути к датасету и папке экспорта.
+        format:  "yolo" — создаёт export/yolo/data.yaml
+                 "coco" — создаёт export/coco/annotations.json
 
     Returns:
         Словарь со статистикой экспорта.
@@ -197,20 +202,36 @@ def export(format: str = "yolo") -> dict:
     Raises:
         ValueError: если передан неизвестный формат.
     """
+    # Подключаем файловый лог проекта — все записи logger попадут
+    # в project.logs_dir/exporter.log
+    get_logger(__name__, project.logs_dir)
+
     supported = {"yolo", "coco"}
     if format not in supported:
         raise ValueError(f"Неизвестный формат '{format}'. Доступные: {supported}")
 
     logger.info("=" * 50)
-    logger.info(f"Exporter | формат={format}")
+    logger.info(f"Exporter | project={project.name} | формат={format}")
     logger.info("=" * 50)
 
+    # Пути к датасету и выходной папке берём из проекта
+    images_dir = project.dataset_images_dir
+    labels_dir = project.dataset_labels_dir
+    out_dir    = project.export_dir / format
+
     if format == "yolo":
-        stats = export_yolo()
+        stats = export_yolo(images_dir, out_dir)
     else:
-        stats = export_coco()
+        stats = export_coco(images_dir, labels_dir, out_dir)
 
     logger.info("ИТОГ: " + str(stats))
     logger.info("=" * 50)
+
+    # Обновляем метаданные проекта
+    project.update_step("export")
+    project.update_stats({
+        "exported_format": format,
+        "exported_images": stats.get("images", 0),
+    })
 
     return stats

@@ -19,8 +19,9 @@ from typing import List, Optional
 import cv2
 import numpy as np
 
-import config  # Централизованные настройки и пути проекта
+import config  # Централизованные настройки (AUGMENT_RESIZE, AUGMENT_QUALITY, TARGET_*)
 from modules.logger import get_logger
+from modules.project import Project
 
 logger = get_logger(__name__)
 
@@ -155,10 +156,34 @@ def add_rain(image: np.ndarray, intensity: float = 0.5) -> np.ndarray:
     # Максимальное расстояние от центра (угол кадра)
     max_dist = np.sqrt(cx ** 2 + cy ** 2)
 
-    num_drops = np.random.randint(2500, 3501)
-    n_large  = int(num_drops * 0.15)
-    n_medium = int(num_drops * 0.55)
-    n_small  = num_drops - n_large - n_medium
+    def _odd(n: int) -> int:
+        """Возвращает ближайшее нечётное число >= 3 (требование GaussianBlur)."""
+        n = max(3, n)
+        return n if n % 2 == 1 else n + 1
+
+    # Фиксированное число капель — одинаковая «наполненность» кадра
+    # при любом разрешении; размеры капель уже масштабируются через h
+    num_drops = np.random.randint(2000, 2501)
+    n_large   = int(num_drops * 0.15)
+    n_medium  = int(num_drops * 0.55)
+    n_small   = num_drops - n_large - n_medium
+
+    # Размеры капель и blur-ядер — относительно высоты кадра,
+    # чтобы эффект не зависел от разрешения исходного видео
+    lo_large,  hi_large  = int(h * 0.05),  int(h * 0.09)
+    lo_medium, hi_medium = int(h * 0.025), int(h * 0.05)
+    lo_small,  hi_small  = int(h * 0.008), int(h * 0.02)
+
+    # Blur-ядра для трёх слоёв, сохраняем исходное соотношение 51:21:7
+    k_large  = _odd(int(h * 0.014))         # ≈51 при h=3648, ≈9  при h=640
+    k_medium = _odd(int(h * 0.0057))        # ≈21 при h=3648, ≈5  при h=640
+    k_small  = _odd(int(h * 0.002))         # ≈7  при h=3648, ≈3  при h=640
+
+    # Толщина штриха тоже масштабируется — иначе на маленьком кадре
+    # крупные капли (thick=10) перекрывают всё изображение
+    thick_large  = max(1, int(h * 0.003))   # ≈10 при h=3648
+    thick_medium = max(1, int(h * 0.0014))  # ≈5  при h=3648
+    thick_small  = 1
 
     def _make_layer(n: int, len_lo: int, len_hi: int, thick: int) -> np.ndarray:
         """Рисует n капель на чёрном слое; радиальный угол вычислен векторно."""
@@ -167,6 +192,8 @@ def add_rain(image: np.ndarray, intensity: float = 0.5) -> np.ndarray:
         # Генерируем все координаты и длины сразу — ускоряет numpy-вычисления
         xs      = np.random.randint(0, w, n).astype(np.float32)
         ys      = np.random.randint(0, h, n).astype(np.float32)
+        len_lo  = max(1, len_lo)
+        len_hi  = max(len_lo + 1, len_hi)
         lengths = np.random.randint(len_lo, len_hi + 1, n).astype(np.float32)
 
         # Вектор от центра до каждой капли
@@ -209,17 +236,17 @@ def add_rain(image: np.ndarray, intensity: float = 0.5) -> np.ndarray:
 
         return layer
 
-    # Крупные капли: очень сильный blur — полупрозрачные «пятна» воды
-    layer_large = _make_layer(n_large, 100, 190, 10)
-    layer_large = cv2.GaussianBlur(layer_large, (51, 51), sigmaX=0)
+    # Крупные капли: сильный blur — полупрозрачные «пятна» воды
+    layer_large = _make_layer(n_large, lo_large, hi_large, thick_large)
+    layer_large = cv2.GaussianBlur(layer_large, (k_large, k_large), sigmaX=0)
 
     # Средние капли: заметный blur — размытые штрихи
-    layer_medium = _make_layer(n_medium, 45, 95, 5)
-    layer_medium = cv2.GaussianBlur(layer_medium, (21, 21), sigmaX=0)
+    layer_medium = _make_layer(n_medium, lo_medium, hi_medium, thick_medium)
+    layer_medium = cv2.GaussianBlur(layer_medium, (k_medium, k_medium), sigmaX=0)
 
     # Мелкие капли: лёгкий blur — далёкие капли тоже не чёткие
-    layer_small = _make_layer(n_small, 5, 45, 1)
-    layer_small = cv2.GaussianBlur(layer_small, (7, 7), sigmaX=0)
+    layer_small = _make_layer(n_small, lo_small, hi_small, thick_small)
+    layer_small = cv2.GaussianBlur(layer_small, (k_small, k_small), sigmaX=0)
 
     rain_layer = cv2.add(cv2.add(layer_large, layer_medium), layer_small)
     result = cv2.addWeighted(image, 1.0, rain_layer, 0.38, 0)
@@ -388,31 +415,37 @@ def _collect_source_frames(source_dir: Path) -> List[Path]:
     return frames
 
 
-def _find_annotation(frame_path: Path, sources_map: dict) -> Optional[Path]:
-    """Ищет txt-файл разметки для заданного кадра.
+def _find_annotation(
+    frame_path: Path,
+    annotations_dir: Path,
+    sources_map: dict,
+) -> Optional[Path]:
+    """Ищет txt-файл разметки для заданного кадра в папке аннотаций проекта.
 
-    Перебирает все подпапки ANNOTATIONS_DIR и ищет файл с именем кадра.
+    Сначала проверяет подпапки для каждого известного источника,
+    затем — все остальные подпапки annotations_dir.
     Не зависит от префикса имени файла — работает с любыми именами.
 
     Args:
-        frame_path:  путь к кадру.
-        sources_map: словарь {имя_источника: Path(frames_dir)} — используется
-                     для определения списка подпапок аннотаций.
+        frame_path:      путь к кадру.
+        annotations_dir: корневая папка аннотаций проекта (project.annotations_dir).
+        sources_map:     словарь {имя_источника: Path(frames_dir)} — определяет
+                         список подпапок для приоритетного поиска.
 
     Returns:
         Путь к txt-файлу аннотации или None, если файл не найден.
     """
     target = frame_path.stem + ".txt"
 
-    # Сначала ищем в подпапках, соответствующих известным источникам
+    # Приоритетный поиск: подпапки известных источников (real, airsim)
     for source_name in sources_map:
-        ann_file = config.ANNOTATIONS_DIR / source_name / target
+        ann_file = annotations_dir / source_name / target
         if ann_file.exists():
             return ann_file
 
-    # Затем перебираем все остальные подпапки ANNOTATIONS_DIR
-    if config.ANNOTATIONS_DIR.exists():
-        for subdir in config.ANNOTATIONS_DIR.iterdir():
+    # Резервный поиск: все остальные подпапки папки аннотаций
+    if annotations_dir.exists():
+        for subdir in annotations_dir.iterdir():
             if not subdir.is_dir():
                 continue
             ann_file = subdir / target
@@ -427,12 +460,13 @@ def _find_annotation(frame_path: Path, sources_map: dict) -> Optional[Path]:
 # ---------------------------------------------------------------------------
 
 def augment_dataset(
+    project: Project,
     augmentation_types: List[str],
     intensity: float = 0.5,
     sources: List[str] = None,
     overwrite: bool = False,
 ) -> dict:
-    """Применяет аугментации ко всем кадрам датасета.
+    """Применяет аугментации ко всем кадрам датасета проекта.
 
     Для каждого оригинального кадра и каждого типа аугментации создаётся
     новый файл рядом с оригиналом:
@@ -442,11 +476,12 @@ def augment_dataset(
     геометрические координаты объектов при пиксельных аугментациях не меняются.
 
     Args:
+        project:            объект Project — определяет пути к кадрам и аннотациям.
         augmentation_types: список типов аугментации из набора:
                             ["fog", "rain", "noise", "blur", "brightness"].
         intensity:          единая сила эффекта для всех типов [0.0, 1.0].
         sources:            список источников ("real", "airsim").
-                            По умолчанию — все существующие.
+                            По умолчанию — все источники проекта.
         overwrite:          если True, перезаписывать уже созданные копии.
 
     Returns:
@@ -455,12 +490,11 @@ def augment_dataset(
 
     Raises:
         ValueError: если передан неизвестный тип аугментации.
-
-    Пример использования:
-        >>> from modules.augmentor import augment_dataset
-        >>> stats = augment_dataset(["fog", "rain"], intensity=0.4)
-        >>> print(stats)  # {"processed_frames": 125, "created": 250, ...}
     """
+    # Подключаем файловый лог проекта — все записи logger попадут
+    # в project.logs_dir/augmentor.log
+    get_logger(__name__, project.logs_dir)
+
     # Проверяем корректность переданных типов аугментации
     unknown = set(augmentation_types) - set(AUGMENTATIONS)
     if unknown:
@@ -472,16 +506,19 @@ def augment_dataset(
     # Убираем дубликаты, сохраняя порядок
     augmentation_types = list(dict.fromkeys(augmentation_types))
 
-    # Карта источников: имя → папка с кадрами
+    # Карта источников: имя → папка с кадрами (из объекта project)
     sources_map = {
-        "real": config.FRAMES_REAL_DIR,
-        "airsim": config.FRAMES_AIRSIM_DIR,
+        "real":   project.frames_real_dir,
+        "airsim": project.frames_airsim_dir,
     }
     if sources is not None:
         sources_map = {k: v for k, v in sources_map.items() if k in sources}
 
     logger.info("=" * 50)
-    logger.info(f"Augmentor | аугментации={augmentation_types} | intensity={intensity}")
+    logger.info(
+        f"Augmentor | project={project.name} | "
+        f"аугментации={augmentation_types} | intensity={intensity}"
+    )
     logger.info("=" * 50)
 
     processed_frames = 0  # оригинальных кадров обработано
@@ -512,8 +549,8 @@ def augment_dataset(
 
             processed_frames += 1
 
-            # Ищем соответствующий файл разметки (может отсутствовать — это нормально)
-            ann_src = _find_annotation(frame_path, sources_map)
+            # Ищем соответствующий файл разметки в папке аннотаций проекта
+            ann_src = _find_annotation(frame_path, project.annotations_dir, sources_map)
 
             for aug_type in augmentation_types:
                 # Формируем имя нового файла: оригинальное_имя + _тип.jpg
@@ -522,15 +559,16 @@ def augment_dataset(
 
                 image_exists = aug_path.exists()
 
-                # Пропускаем картинку если она уже создана и перезапись не нужна
+                # Пропускаем картинку, если она уже создана и перезапись не нужна
                 if image_exists and not overwrite:
                     skipped += 1
                 else:
                     try:
-                        aug_func = AUGMENTATIONS[aug_type]
+                        aug_func  = AUGMENTATIONS[aug_type]
+                        # Аугментация на оригинальном разрешении — параметры дождя
+                        # и других эффектов масштабируются под реальный размер кадра
                         aug_image = aug_func(image, intensity)
-
-                        # Ресайз до целевого разрешения перед сохранением
+                        # Ресайз после аугментации — сохраняем в целевое разрешение
                         if config.AUGMENT_RESIZE:
                             aug_image = cv2.resize(
                                 aug_image,
@@ -565,9 +603,9 @@ def augment_dataset(
     # Итоговый отчёт
     stats = {
         "processed_frames": processed_frames,
-        "created": created,
-        "skipped": skipped,
-        "errors": errors,
+        "created":          created,
+        "skipped":          skipped,
+        "errors":           errors,
     }
 
     logger.info("=" * 50)
@@ -577,5 +615,9 @@ def augment_dataset(
     logger.info(f"  Пропущено (уже существуют)     : {skipped}")
     logger.info(f"  Ошибок                         : {errors}")
     logger.info("=" * 50)
+
+    # Обновляем метаданные проекта
+    project.update_step("augment")
+    project.update_stats({"augmented_frames": created})
 
     return stats

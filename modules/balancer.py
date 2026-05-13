@@ -6,13 +6,13 @@
 # Пайплайн (запускается через build()):
 #   1. filter_frames()    — отбрасывает тёмные, размытые и битые кадры
 #   2. balance_dataset()  — выравнивает соотношение позитивных/негативных примеров
-#   3. collect_dataset()  — копирует итоговый набор в data/processed/dataset/
+#   3. collect_dataset()  — копирует итоговый набор в папку датасета проекта
 #
 # Публичный интерфейс:
-#   filter_frames(frames)       → List[Path]
-#   balance_dataset(frames)     → List[Path]
-#   collect_dataset(frames)     → dict
-#   build(sources, overwrite)   → dict
+#   filter_frames(frames)              → List[Path]
+#   balance_dataset(frames)            → List[Path]
+#   collect_dataset(frames, overwrite) → dict
+#   build(project, sources, overwrite) → dict
 
 import random
 import shutil
@@ -24,20 +24,27 @@ import numpy as np
 
 import config
 from modules.logger import get_logger
+from modules.project import Project
 
 logger = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Карта источников: имя → папка с кадрами
-# ---------------------------------------------------------------------------
-
-SOURCES = {
-    "real": config.FRAMES_REAL_DIR,
-    "airsim": config.FRAMES_AIRSIM_DIR,
-}
-
 # Допустимые расширения изображений
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+
+# ---------------------------------------------------------------------------
+# Контекст активного проекта
+#
+# balance_dataset() и filter_frames() нельзя трогать, но они вызывают
+# _find_annotation(), которой нужны пути из проекта.
+# Решение: build() устанавливает эти переменные перед вызовом pipeline,
+# а _find_annotation() и collect_dataset() читают их.
+# ---------------------------------------------------------------------------
+
+# Корневая папка аннотаций текущего проекта (project.annotations_dir)
+_active_annotations_dir: Optional[Path] = None
+
+# Карта источников текущего проекта: {"real": Path, "airsim": Path}
+_active_sources_map: dict = {}
 
 
 # ---------------------------------------------------------------------------
@@ -62,8 +69,12 @@ def _imread(path: Path) -> Optional[np.ndarray]:
 def _find_annotation(frame_path: Path) -> Optional[Path]:
     """Ищет txt-файл разметки для кадра по имени файла.
 
-    Перебирает все подпапки ANNOTATIONS_DIR и ищет файл с именем кадра.
-    Не зависит от префикса — работает с любыми именами файлов (real_, airsim_, 01_ и т.д.).
+    Использует пути активного проекта (_active_annotations_dir),
+    установленные функцией build(). Перебирает подпапки источников,
+    затем все остальные подпапки папки аннотаций.
+
+    Сигнатура намеренно не содержит параметра annotations_dir — чтобы
+    её могли вызывать balance_dataset() и filter_frames() без изменений.
 
     Args:
         frame_path: путь к файлу кадра.
@@ -71,17 +82,21 @@ def _find_annotation(frame_path: Path) -> Optional[Path]:
     Returns:
         Путь к txt-файлу аннотации или None, если он не найден.
     """
+    # Берём папку аннотаций из контекста активного проекта
+    ann_dir = _active_annotations_dir if _active_annotations_dir is not None \
+              else config.ANNOTATIONS_DIR
+
     target = frame_path.stem + ".txt"
 
     # Сначала ищем в подпапках известных источников (быстрее для типичного случая)
-    for source_name in SOURCES:
-        ann = config.ANNOTATIONS_DIR / source_name / target
+    for source_name in (_active_sources_map or {"real": None, "airsim": None}):
+        ann = ann_dir / source_name / target
         if ann.exists():
             return ann
 
-    # Затем перебираем все остальные подпапки ANNOTATIONS_DIR
-    if config.ANNOTATIONS_DIR.exists():
-        for subdir in config.ANNOTATIONS_DIR.iterdir():
+    # Затем перебираем все остальные подпапки папки аннотаций
+    if ann_dir.exists():
+        for subdir in ann_dir.iterdir():
             if not subdir.is_dir():
                 continue
             ann = subdir / target
@@ -109,24 +124,25 @@ def _is_positive(ann_path: Optional[Path]) -> bool:
     return len(content) > 0
 
 
-def _collect_all_frames(sources: List[str]) -> List[Path]:
-    """Собирает все кадры изображений из указанных источников.
+def _collect_all_frames(sources: List[str], sources_map: dict) -> List[Path]:
+    """Собирает все кадры изображений из указанных источников проекта.
 
     Включает как оригинальные кадры, так и аугментированные копии —
     они участвуют в фильтрации и балансировке наравне с оригиналами.
 
     Args:
-        sources: список имён источников ("real", "airsim").
+        sources:     список имён источников ("real", "airsim").
+        sources_map: словарь {имя_источника: Path(frames_dir)} из проекта.
 
     Returns:
         Отсортированный список путей ко всем найденным кадрам.
     """
     result = []
     for source in sources:
-        if source not in SOURCES:
+        if source not in sources_map:
             logger.warning(f"Неизвестный источник '{source}', пропускаем.")
             continue
-        frames_dir = SOURCES[source]
+        frames_dir = sources_map[source]
         if not frames_dir.exists():
             logger.warning(f"Папка не найдена: {frames_dir} — пропускаем '{source}'")
             continue
@@ -302,27 +318,31 @@ def balance_dataset(frames: List[Path]) -> List[Path]:
 # 3. Сборка финального датасета
 # ---------------------------------------------------------------------------
 
-def collect_dataset(frames: List[Path], overwrite: bool = False) -> dict:
-    """Копирует отфильтрованные и сбалансированные кадры в папку датасета.
+def collect_dataset(
+    frames: List[Path],
+    images_dir: Path,
+    labels_dir: Path,
+    overwrite: bool = False,
+) -> dict:
+    """Копирует отфильтрованные и сбалансированные кадры в папку датасета проекта.
 
-    Структура вывода:
-        data/processed/dataset/images/  — изображения
-        data/processed/dataset/labels/  — txt-файлы разметки
+    Структура вывода (пути берутся из аргументов, не из config):
+        images_dir/  — изображения
+        labels_dir/  — txt-файлы разметки
 
     Для кадров без txt-аннотации создаётся пустой txt-файл —
     YOLO интерпретирует его как «негативный пример» (фон без объектов).
 
     Args:
-        frames:    список путей к кадрам (результат balance_dataset).
-        overwrite: если True, перезаписывать уже существующие файлы.
+        frames:     список путей к кадрам (результат balance_dataset).
+        images_dir: куда копировать изображения (project.dataset_images_dir).
+        labels_dir: куда копировать метки (project.dataset_labels_dir).
+        overwrite:  если True, перезаписывать уже существующие файлы.
 
     Returns:
         Словарь со статистикой:
         {"copied": int, "skipped": int, "labels_created": int, "labels_copied": int}
     """
-    images_dir = config.DATASET_IMAGES_DIR
-    labels_dir = config.DATASET_LABELS_DIR
-
     images_dir.mkdir(parents=True, exist_ok=True)
     labels_dir.mkdir(parents=True, exist_ok=True)
 
@@ -346,7 +366,7 @@ def collect_dataset(frames: List[Path], overwrite: bool = False) -> dict:
         shutil.copy2(str(frame_path), str(dst_img))
         copied += 1
 
-        # Ищем соответствующую аннотацию
+        # Ищем соответствующую аннотацию через контекст активного проекта
         ann_src = _find_annotation(frame_path)
 
         if ann_src is not None:
@@ -370,9 +390,9 @@ def collect_dataset(frames: List[Path], overwrite: bool = False) -> dict:
     )
 
     return {
-        "copied": copied,
-        "skipped": skipped,
-        "labels_copied": labels_copied,
+        "copied":         copied,
+        "skipped":        skipped,
+        "labels_copied":  labels_copied,
         "labels_created": labels_created,
     }
 
@@ -381,18 +401,23 @@ def collect_dataset(frames: List[Path], overwrite: bool = False) -> dict:
 # 4. Главная функция пайплайна
 # ---------------------------------------------------------------------------
 
-def build(sources: List[str] = None, overwrite: bool = False) -> dict:
-    """Запускает полный пайплайн сборки датасета.
+def build(
+    project: Project,
+    sources: List[str] = None,
+    overwrite: bool = False,
+) -> dict:
+    """Запускает полный пайплайн сборки датасета проекта.
 
     Шаги:
-        1. Собирает все кадры из указанных источников.
+        1. Собирает все кадры из указанных источников проекта.
         2. filter_frames()    — фильтрует некачественные кадры.
         3. balance_dataset()  — балансирует позитивные/негативные примеры.
-        4. collect_dataset()  — копирует финальный датасет на диск.
+        4. collect_dataset()  — копирует финальный датасет в папку проекта.
 
     Args:
+        project:   объект Project — определяет пути к кадрам, аннотациям и датасету.
         sources:   список источников для обработки ("real", "airsim").
-                   По умолчанию — все зарегистрированные.
+                   По умолчанию — все источники проекта.
         overwrite: если True, перезаписывать уже существующие файлы датасета.
 
     Returns:
@@ -408,24 +433,39 @@ def build(sources: List[str] = None, overwrite: bool = False) -> dict:
             "labels_copied":  int,
             "labels_created": int,
         }
-
-    Пример использования:
-        >>> from modules.balancer import build
-        >>> report = build(sources=["real"], overwrite=True)
-        >>> print(report)
     """
+    global _active_annotations_dir, _active_sources_map
+
+    # Подключаем файловый лог проекта — все записи logger попадут
+    # в project.logs_dir/balancer.log
+    get_logger(__name__, project.logs_dir)
+
+    # Устанавливаем контекст активного проекта — _find_annotation() будет
+    # использовать эти переменные вместо config, в т.ч. внутри balance_dataset()
+    sources_map = {
+        "real":   project.frames_real_dir,
+        "airsim": project.frames_airsim_dir,
+    }
+    _active_annotations_dir = project.annotations_dir
+    _active_sources_map     = sources_map
+
     if sources is None:
-        sources = list(SOURCES.keys())
+        sources = list(sources_map.keys())
 
     logger.info("=" * 50)
-    logger.info(f"Balancer | источники={sources} | перезапись={overwrite}")
-    logger.info(f"Пороги: MIN_BRIGHTNESS={config.MIN_BRIGHTNESS}, "
-                f"BLUR_THRESHOLD={config.BLUR_THRESHOLD}, "
-                f"POS_NEG_RATIO=1:{config.POS_NEG_RATIO}")
+    logger.info(
+        f"Balancer | project={project.name} | "
+        f"источники={sources} | перезапись={overwrite}"
+    )
+    logger.info(
+        f"Пороги: MIN_BRIGHTNESS={config.MIN_BRIGHTNESS}, "
+        f"BLUR_THRESHOLD={config.BLUR_THRESHOLD}, "
+        f"POS_NEG_RATIO=1:{config.POS_NEG_RATIO}"
+    )
     logger.info("=" * 50)
 
     # --- Шаг 1: сбор всех кадров ---
-    all_frames = _collect_all_frames(sources)
+    all_frames  = _collect_all_frames(sources, sources_map)
     total_input = len(all_frames)
 
     if not all_frames:
@@ -453,32 +493,49 @@ def build(sources: List[str] = None, overwrite: bool = False) -> dict:
     # --- Шаг 4: сборка датасета ---
     logger.info("-" * 50)
     logger.info("Шаг 3/3: сборка финального датасета")
-    collect_stats = collect_dataset(balanced, overwrite=overwrite)
+    collect_stats = collect_dataset(
+        balanced,
+        images_dir=project.dataset_images_dir,
+        labels_dir=project.dataset_labels_dir,
+        overwrite=overwrite,
+    )
 
     # --- Итоговый отчёт ---
     report = {
-        "total_input": total_input,
-        "after_filter": len(filtered),
+        "total_input":   total_input,
+        "after_filter":  len(filtered),
         "after_balance": len(balanced),
-        "positives": final_positives,
-        "negatives": final_negatives,
+        "positives":     final_positives,
+        "negatives":     final_negatives,
         **collect_stats,
     }
 
     logger.info("=" * 50)
     logger.info("ИТОГОВЫЙ ОТЧЁТ:")
     logger.info(f"  Кадров на входе          : {report['total_input']}")
-    logger.info(f"  После фильтрации         : {report['after_filter']}"
-                f"  (отброшено {total_input - report['after_filter']})")
-    logger.info(f"  После балансировки       : {report['after_balance']}"
-                f"  (отброшено {report['after_filter'] - report['after_balance']})")
+    logger.info(
+        f"  После фильтрации         : {report['after_filter']}"
+        f"  (отброшено {total_input - report['after_filter']})"
+    )
+    logger.info(
+        f"  После балансировки       : {report['after_balance']}"
+        f"  (отброшено {report['after_filter'] - report['after_balance']})"
+    )
     logger.info(f"  Позитивных примеров      : {report['positives']}")
     logger.info(f"  Негативных примеров      : {report['negatives']}")
     logger.info(f"  Скопировано изображений  : {report['copied']}")
     logger.info(f"  Меток скопировано        : {report['labels_copied']}")
     logger.info(f"  Меток создано (пустых)   : {report['labels_created']}")
     logger.info(f"  Пропущено (существуют)   : {report['skipped']}")
-    logger.info(f"  Датасет: {config.DATASET_IMAGES_DIR}")
+    logger.info(f"  Датасет: {project.dataset_images_dir}")
     logger.info("=" * 50)
+
+    # Обновляем метаданные проекта
+    project.update_step("balance")
+    project.update_stats({
+        "dataset_frames": len(balanced),
+        "positive":       final_positives,
+        "negative":       final_negatives,
+    })
 
     return report

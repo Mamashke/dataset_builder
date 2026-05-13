@@ -1,65 +1,22 @@
 # modules/loader.py — модуль загрузки и первичной обработки видеоданных.
 #
-# Основная задача: принять папку с mp4-файлами, извлечь из каждого видео
-# кадры с заданным шагом, привести их к единому разрешению и сохранить
-# в соответствующую папку внутри data/processed/frames/.
+# Основная задача: принять объект Project, извлечь из каждого видео кадры
+# с заданным шагом, привести их к единому разрешению и сохранить
+# в соответствующую папку внутри проекта.
 #
 # Публичный интерфейс модуля — единственная функция load_videos().
-# Вспомогательные функции (_output_dir, _extract_frames) намеренно скрыты
+# Вспомогательные функции (_extract_frames, _select_videos) намеренно скрыты
 # (префикс _), чтобы не засорять пространство имён при импорте.
 
 from pathlib import Path
-from typing import Union
 
 import cv2  # OpenCV — основная библиотека для работы с видео и изображениями
 
 import config  # Централизованные настройки и пути проекта
 from modules.logger import get_logger
+from modules.project import Project
 
 logger = get_logger(__name__)
-
-# ---------------------------------------------------------------------------
-# Таблица соответствия: имя источника → папка назначения
-# ---------------------------------------------------------------------------
-
-# Словарь связывает строковый идентификатор источника с путём из config.
-# Добавление нового источника в будущем требует только одной строки здесь.
-SOURCES = {
-    "real": config.FRAMES_REAL_DIR,      # реальные видеозаписи
-    "airsim": config.FRAMES_AIRSIM_DIR,  # записи из симулятора AirSim
-}
-
-
-# ---------------------------------------------------------------------------
-# Вспомогательная функция: подготовка выходной директории
-# ---------------------------------------------------------------------------
-
-def _output_dir(source: str) -> Path:
-    """Проверяет корректность имени источника и возвращает путь к папке вывода.
-
-    Создаёт папку (и все промежуточные директории), если она не существует.
-
-    Args:
-        source: идентификатор источника — "real" или "airsim".
-
-    Returns:
-        Абсолютный путь к папке, куда нужно сохранять кадры.
-
-    Raises:
-        ValueError: если передано неизвестное имя источника.
-    """
-    # Проверяем, что источник входит в список допустимых значений.
-    # Это защищает от опечаток вроде "Real" или "AirSim".
-    if source not in SOURCES:
-        raise ValueError(f"Unknown source '{source}'. Expected: {list(SOURCES)}")
-
-    out = SOURCES[source]
-
-    # parents=True  — создаёт все промежуточные папки (как mkdir -p)
-    # exist_ok=True — не бросает исключение, если папка уже есть
-    out.mkdir(parents=True, exist_ok=True)
-
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -92,59 +49,33 @@ def _extract_frames(
     Returns:
         Количество сохранённых кадров (0, если видео не удалось открыть).
     """
-    # Открываем видеофайл через OpenCV.
-    # cv2.VideoCapture принимает строку, поэтому Path конвертируется через str().
     cap = cv2.VideoCapture(str(video_path))
 
-    # Проверяем, что файл успешно открыт.
-    # Это может не сработать при повреждённом файле или неверном пути.
     if not cap.isOpened():
         logger.warning(f"Cannot open video: {video_path.name} — skipping")
-        return 0  # Возвращаем 0, чтобы не прерывать обработку остальных файлов
+        return 0
 
-    # Общее число кадров в видео — используется только для информативного лога.
-    # CAP_PROP_FRAME_COUNT возвращает float, поэтому приводим к int.
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    # Имя файла без расширения — войдёт в имя каждого сохранённого кадра.
     video_stem = video_path.stem
 
-    saved = 0      # счётчик сохранённых кадров для текущего видео
-    frame_idx = 0  # порядковый номер текущего кадра (с нуля)
+    saved = 0
+    frame_idx = 0
 
     logger.info(f"Processing '{video_path.name}' ({total_frames} frames, step={sample_rate})")
 
-    # Основной цикл чтения кадров.
-    # cap.read() возвращает (True, кадр) при успехе или (False, None) в конце файла.
     while True:
         ret, frame = cap.read()
-
-        # ret == False означает конец видео или ошибку чтения — выходим из цикла
         if not ret:
             break
 
-        # Сохраняем только каждый sample_rate-й кадр.
-        # frame_idx % sample_rate == 0 истинно для кадров 0, 5, 10, 15, ...
         if frame_idx % sample_rate == 0:
-            # Масштабируем кадр до целевого разрешения.
-            # INTER_AREA — оптимальный алгоритм для уменьшения изображения:
-            # усредняет пиксели области, что даёт более чёткий результат
-            # по сравнению с билинейной или ближайшей интерполяцией.
             resized = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
-
-            # Формируем имя файла: real_video1_frame_000025.jpg
-            # :06d — номер кадра с ведущими нулями до 6 цифр,
-            # что обеспечивает правильную сортировку по имени файла.
             filename = f"{source}_{video_stem}_frame_{frame_idx:06d}.{fmt}"
-
-            # Сохраняем кадр на диск.
-            # cv2.imwrite автоматически выбирает кодек по расширению файла.
             cv2.imwrite(str(output_dir / filename), resized)
             saved += 1
 
-        frame_idx += 1  # переходим к следующему кадру
+        frame_idx += 1
 
-    # Освобождаем ресурсы видеодекодера (закрываем файл).
     cap.release()
 
     logger.info(f"  Saved {saved} frames from '{video_path.name}'")
@@ -160,7 +91,7 @@ def _select_videos(videos: list) -> list:
 
     Три сценария:
     - 0 файлов: сообщает об отсутствии и возвращает пустой список.
-    - 1 файл:   сразу возвращает его без вопросов.
+    - 1 файл:   запрашивает подтверждение перед обработкой.
     - N файлов: печатает нумерованный список, запрашивает ввод в цикле
                 до получения корректного ответа.
 
@@ -194,7 +125,6 @@ def _select_videos(videos: list) -> list:
         size_mb = round(v.stat().st_size / (1024 * 1024))
         print(f"  {i}. {v.name} ({size_mb} МБ)")
 
-    # Цикл повторяется до получения валидного ввода
     while True:
         raw = input('\nКакие файлы обработать? (all / номера через запятую: 1,2): ').strip()
 
@@ -202,14 +132,12 @@ def _select_videos(videos: list) -> list:
             logger.info(f"Пользователь выбрал: все {n} файлов")
             return videos
 
-        # Парсим список номеров: "1,3" → [1, 3]
         try:
             indices = [int(x.strip()) for x in raw.split(",") if x.strip()]
         except ValueError:
             print(f"  Неверный ввод. Введите 'all' или номера через запятую (например: 1,2).")
             continue
 
-        # Проверяем, что все номера в допустимом диапазоне [1, n]
         invalid = [i for i in indices if i < 1 or i > n]
         if invalid:
             print(f"  Неверные номера: {invalid}. Допустимый диапазон: 1–{n}.")
@@ -219,7 +147,6 @@ def _select_videos(videos: list) -> list:
             print(f"  Список пуст. Введите 'all' или хотя бы один номер.")
             continue
 
-        # Убираем дубликаты, сохраняем порядок, переходим к 0-based индексам
         seen = set()
         selected = []
         for i in indices:
@@ -236,24 +163,28 @@ def _select_videos(videos: list) -> list:
 # Публичная функция модуля
 # ---------------------------------------------------------------------------
 
+_VALID_SOURCES = ("real", "airsim")
+
+
 def load_videos(
-    input_dir: Union[str, Path],
+    project: Project,
     source: str,
     sample_rate: int = config.FRAME_SAMPLE_RATE,
     width: int = config.TARGET_WIDTH,
     height: int = config.TARGET_HEIGHT,
     fmt: str = config.FRAME_FORMAT,
 ) -> dict:
-    """Извлекает кадры из выбранных mp4-файлов в указанной папке.
+    """Извлекает кадры из выбранных mp4-файлов проекта.
 
     При наличии нескольких видео предлагает интерактивный выбор:
     пользователь вводит "all" или номера через запятую (1,2).
-    При одном файле обработка начинается без вопросов.
+    При одном файле запрашивает подтверждение перед обработкой.
 
     Args:
-        input_dir:   путь к папке с исходными mp4-файлами.
+        project:     объект Project — определяет пути к видео и кадрам.
         source:      идентификатор источника — "real" или "airsim".
-                     Определяет папку назначения и префикс имён файлов.
+                     Определяет папку с исходными видео, папку назначения
+                     и префикс имён сохраняемых файлов.
         sample_rate: сохранять каждый N-й кадр (по умолчанию из config).
         width:       ширина выходных кадров в пикселях.
         height:      высота выходных кадров в пикселях.
@@ -263,29 +194,46 @@ def load_videos(
         {"videos": <кол-во обработанных файлов>, "frames": <кол-во кадров>}
 
     Raises:
-        FileNotFoundError: если папка input_dir не существует.
         ValueError:        если source не входит в допустимые значения.
+        FileNotFoundError: если папка с исходными видео не существует.
     """
-    input_dir = Path(input_dir)
+    # Подключаем файловый лог проекта — все записи logger в этом модуле
+    # (включая вызовы из _extract_frames) попадут в project.logs_dir/loader.log
+    get_logger(__name__, project.logs_dir)
+
+    if source not in _VALID_SOURCES:
+        raise ValueError(f"Неизвестный источник '{source}'. Допустимые: {list(_VALID_SOURCES)}")
+
+    # Пути берём из объекта project, а не из глобального config
+    if source == "real":
+        input_dir  = project.raw_real_dir
+        output_dir = project.frames_real_dir
+    else:
+        input_dir  = project.raw_airsim_dir
+        output_dir = project.frames_airsim_dir
 
     if not input_dir.exists():
-        raise FileNotFoundError(f"Папка не найдена: {input_dir}")
+        raise FileNotFoundError(f"Папка с видео не найдена: {input_dir}")
 
     all_videos = sorted(input_dir.glob("*.mp4"))
 
     # --- Случай 1: видеофайлов нет ---
     if not all_videos:
         logger.warning(f"Видеофайлы не найдены в папке: {input_dir}")
-        return {"videos": 0, "frames": 0}
+        stats = {"videos": 0, "frames": 0}
+        project.update_stats({"load": stats})
+        return stats
 
     # --- Случаи 2 и 3: интерактивный выбор ---
     selected = _select_videos(all_videos)
 
     if not selected:
         logger.warning("Ни один файл не выбран — завершаем работу.")
-        return {"videos": 0, "frames": 0}
+        stats = {"videos": 0, "frames": 0}
+        project.update_stats({"load": stats})
+        return stats
 
-    output_dir = _output_dir(source)
+    output_dir.mkdir(parents=True, exist_ok=True)
     total_frames = 0
 
     for video_path in selected:
@@ -295,10 +243,12 @@ def load_videos(
 
     logger.info("=" * 50)
     logger.info(
-        f"DONE | source={source} | обработано={len(selected)} | "
-        f"извлечено кадров={total_frames}"
+        f"DONE | project={project.name} | source={source} | "
+        f"обработано={len(selected)} | извлечено кадров={total_frames}"
     )
     logger.info(f"Результат: {output_dir}")
     logger.info("=" * 50)
 
-    return {"videos": len(selected), "frames": total_frames}
+    stats = {"videos": len(selected), "frames": total_frames}
+    project.update_stats({"load": stats})
+    return stats

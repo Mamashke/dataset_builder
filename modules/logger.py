@@ -89,20 +89,49 @@ def setup_run_log() -> Path:
     return run_log_path
 
 
-def get_logger(name: str) -> logging.Logger:
+def get_logger(name: str, logs_dir: Path = None) -> logging.Logger:
     """Возвращает логгер с указанным именем.
 
-    Использование во всех модулях:
-        from modules.logger import get_logger
-        logger = get_logger(__name__)
+    Если передан logs_dir, дополнительно добавляет файловый обработчик,
+    который пишет в logs_dir/{короткое_имя}.log (например, loader.log).
+    Повторные вызовы с тем же файлом не создают дублирующих обработчиков.
+
+    Использование в модулях:
+        logger = get_logger(__name__)                         # только глобальный лог
+        logger = get_logger("loader", project.logs_dir)      # + лог проекта
 
     Args:
-        name: имя логгера, обычно __name__ модуля (например, "modules.loader").
+        name:     имя логгера, обычно __name__ (например, "modules.loader").
+        logs_dir: если передан — папка для проектного лог-файла.
+                  Папка создаётся автоматически.
 
     Returns:
         Настроенный экземпляр logging.Logger.
     """
-    return logging.getLogger(name)
+    log = logging.getLogger(name)
+
+    if logs_dir is not None:
+        logs_dir = Path(logs_dir)
+        logs_dir.mkdir(parents=True, exist_ok=True)
+
+        # Имя файла — последняя часть имени логгера: "modules.loader" → "loader.log"
+        short_name = name.split(".")[-1]
+        log_file   = logs_dir / f"{short_name}.log"
+
+        # Проверяем, что обработчик для этого файла ещё не добавлен,
+        # чтобы не дублировать записи при повторных вызовах
+        existing_paths = {
+            Path(h.baseFilename).resolve()
+            for h in log.handlers
+            if isinstance(h, logging.FileHandler)
+        }
+        if log_file.resolve() not in existing_paths:
+            formatter   = logging.Formatter(_FORMAT, _DATEFMT)
+            file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+            file_handler.setFormatter(formatter)
+            log.addHandler(file_handler)
+
+    return log
 
 
 # Инициализируем при импорте — до того как любой модуль создаст свой logger
