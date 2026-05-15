@@ -13,17 +13,24 @@
 #   python main.py --project "название" --augment
 #   python main.py --project "название" --balance
 #   python main.py --project "название" --export --format coco
+#
+# Очистка данных проекта (требуется --project):
+#   python main.py --project "название" --clean              # интерактивное меню
+#   python main.py --project "название" --clean --frames     # удалить только кадры
+#   python main.py --project "название" --clean --processed  # кадры + аннотации
+#   python main.py --project "название" --clean --all-data   # всё кроме raw/
 
 import argparse
+import shutil
 import sys
 import time
+from pathlib import Path
 
 # Лог текущего запуска создаётся первым — до импорта остальных модулей,
 # чтобы все их сообщения попали в run_*.log
 from modules.logger import get_logger, setup_run_log
 
-run_log = setup_run_log()
-logger  = get_logger(__name__)
+logger = get_logger(__name__)
 
 from modules.loader    import load_videos
 from modules.annotator import run_interactive as annotate_interactive
@@ -42,7 +49,7 @@ BANNER = """\
    Конструктор обучающей выборки
 ================================"""
 
-# Порядок шагов пайплайна — он фиксирован и используется в нескольких местах
+# Порядок шагов пайплайна — фиксирован и используется в нескольких местах
 PIPELINE_STEPS = ["load", "annotate", "augment", "balance", "export"]
 
 STEP_NAMES = {
@@ -58,6 +65,22 @@ _START_FROM_MAP = {
     "1": "load",      # есть видео → начинаем с извлечения кадров
     "2": "annotate",  # есть кадры → начинаем с разметки
     "3": "balance",   # есть размеченный датасет → сразу балансировка
+}
+
+# Папки, которые затрагивает каждый уровень очистки.
+# raw/, project.json и logs/ никогда не удаляются.
+_CLEAN_DIRS = {
+    "frames":    ["frames"],
+    "processed": ["frames", "annotations"],
+    "all_data":  ["frames", "annotations", "dataset", "export"],
+}
+
+# Ключи статистики, которые сбрасываются после каждого уровня.
+# None означает «сбросить всю статистику».
+_CLEAN_STATS_KEYS = {
+    "frames":    ["load", "augmented_frames"],
+    "processed": ["load", "augmented_frames", "annotated"],
+    "all_data":  None,
 }
 
 
@@ -78,6 +101,42 @@ def _step_header(index: int, total: int, name: str) -> None:
     """Печатает заголовок шага пайплайна в консоль и лог."""
     print(f"\n[{index}/{total}] {name}...")
     logger.info(f"[{index}/{total}] Начало: {name}")
+
+
+def _folder_size(path: Path) -> int:
+    """Рекурсивно считает суммарный размер файлов в папке (байты)."""
+    if not path.exists():
+        return 0
+    total = 0
+    for p in path.rglob("*"):
+        if p.is_file():
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def _fmt_size(size_bytes: int) -> str:
+    """Форматирует байты в строку с суффиксом (ГБ / МБ / КБ / Б)."""
+    if size_bytes >= 1024 ** 3:
+        return f"{size_bytes / 1024 ** 3:.2f} ГБ"
+    if size_bytes >= 1024 ** 2:
+        return f"{size_bytes / 1024 ** 2:.1f} МБ"
+    if size_bytes >= 1024:
+        return f"{size_bytes / 1024:.0f} КБ"
+    return f"{size_bytes} Б"
+
+
+def _clear_dir(path: Path) -> None:
+    """Удаляет всё содержимое папки, сохраняя саму папку."""
+    if not path.exists():
+        return
+    for item in path.iterdir():
+        if item.is_dir():
+            shutil.rmtree(item)
+        else:
+            item.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +218,106 @@ def _cmd_delete_project(name: str) -> None:
         name: имя проекта для удаления.
     """
     Project.delete(name)
+
+
+def _cmd_clean_project(project: Project, level: str = None) -> None:
+    """Удаляет обработанные данные проекта на указанном уровне.
+
+    Никогда не удаляет: raw/ (исходные видео), project.json, logs/.
+    После удаления сбрасывает связанные поля статистики в project.json.
+
+    Args:
+        project: объект Project — определяет пути к папкам.
+        level:   "frames", "processed", "all_data" или None для интерактивного выбора.
+    """
+    # Корневые папки уровней очистки
+    frames_dir      = project.frames_real_dir.parent    # frames/
+    annotations_dir = project.annotations_dir            # annotations/
+    dataset_dir     = project.dataset_images_dir.parent  # dataset/
+    export_dir      = project.export_dir                 # export/
+
+    dir_map = {
+        "frames":      frames_dir,
+        "annotations": annotations_dir,
+        "dataset":     dataset_dir,
+        "export":      export_dir,
+    }
+
+    # Интерактивный выбор уровня если флаг не передан
+    if level is None:
+        sz_frames      = _folder_size(frames_dir)
+        sz_annotations = _folder_size(annotations_dir)
+        sz_dataset     = _folder_size(dataset_dir)
+        sz_export      = _folder_size(export_dir)
+
+        sz1 = sz_frames
+        sz2 = sz_frames + sz_annotations
+        sz3 = sz_frames + sz_annotations + sz_dataset + sz_export
+
+        print(f"\nЧто удалить в проекте '{project.name}'?")
+        print(f"  1. Только кадры (frames/)"
+              f"                              — {_fmt_size(sz1)}")
+        print(f"  2. Кадры + аннотации (frames/ + annotations/)"
+              f"           — {_fmt_size(sz2)}")
+        print(f"  3. Все обработанные данные"
+              f" (frames/ + annotations/ + dataset/ + export/) — {_fmt_size(sz3)}")
+        print(f"  4. Отмена")
+
+        while True:
+            raw = input("Выберите (1/2/3/4): ").strip()
+            if raw == "1":
+                level = "frames"
+                break
+            if raw == "2":
+                level = "processed"
+                break
+            if raw == "3":
+                level = "all_data"
+                break
+            if raw == "4":
+                print("Отменено.")
+                return
+            print("  Введите 1, 2, 3 или 4.")
+
+    # Считаем итоговый объём удаляемых данных
+    total_bytes = sum(_folder_size(dir_map[d]) for d in _CLEAN_DIRS[level])
+
+    # Показываем что будет удалено и запрашиваем подтверждение
+    folders_str = " + ".join(f"{d}/" for d in _CLEAN_DIRS[level])
+    print(f"\nБудет удалено: {_fmt_size(total_bytes)}")
+    print(f"Папки: {folders_str}")
+
+    while True:
+        raw = input("Вы уверены? (yes/no): ").strip().lower()
+        if raw == "yes":
+            break
+        if raw == "no":
+            print("Отменено.")
+            return
+        print("  Введите 'yes' или 'no'.")
+
+    # Удаляем содержимое каждой папки (структуру папок сохраняем)
+    for dir_name in _CLEAN_DIRS[level]:
+        path = dir_map[dir_name]
+        _clear_dir(path)
+        logger.info(f"Очищено: {path}")
+
+    # Обновляем project.json: сбрасываем связанные поля статистики
+    meta       = project._read_meta()
+    stats_keys = _CLEAN_STATS_KEYS[level]
+
+    if stats_keys is None:
+        # all_data — стираем всю статистику
+        meta["stats"] = {}
+    else:
+        for key in stats_keys:
+            meta["stats"].pop(key, None)
+
+    meta["current_step"] = None
+    project._write_meta(meta)
+
+    logger.info(f"Очистка завершена: уровень='{level}', удалено={_fmt_size(total_bytes)}")
+    print(f"Готово. Удалено: {_fmt_size(total_bytes)}")
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +489,9 @@ def _parse_args() -> argparse.Namespace:
             "  python main.py --project дрон --all\n"
             "  python main.py --project дрон --all --from annotate\n"
             "  python main.py --project дрон --export --format coco\n"
+            "  python main.py --project дрон --clean\n"
+            "  python main.py --project дрон --clean --frames\n"
+            "  python main.py --project дрон --clean --all-data\n"
         ),
     )
 
@@ -360,8 +522,7 @@ def _parse_args() -> argparse.Namespace:
     )
     grp_run.add_argument(
         "--from", metavar="ШАГ", dest="from_step",
-        choices=PIPELINE_STEPS,
-        help=f"Начать с указанного шага (с --all): {PIPELINE_STEPS}",
+        help=f"Начать с указанного шага (с --all): {', '.join(PIPELINE_STEPS)}",
     )
     grp_run.add_argument("--load",     action="store_true", help="Загрузка видео")
     grp_run.add_argument("--annotate", action="store_true", help="Разметка кадров")
@@ -373,27 +534,64 @@ def _parse_args() -> argparse.Namespace:
         help="Формат экспорта: yolo или coco (используется с --export)",
     )
 
+    # Группа очистки данных
+    grp_clean = parser.add_argument_group("Очистка данных проекта (требуется --project)")
+    grp_clean.add_argument(
+        "--clean", action="store_true",
+        help="Очистить данные проекта (интерактивный выбор или с --frames/--processed/--all-data)",
+    )
+    grp_clean.add_argument(
+        "--frames", action="store_true",
+        help="Удалить только кадры frames/ (с --clean)",
+    )
+    grp_clean.add_argument(
+        "--processed", action="store_true",
+        help="Удалить кадры + аннотации frames/ + annotations/ (с --clean)",
+    )
+    grp_clean.add_argument(
+        "--all-data", action="store_true", dest="all_data",
+        help="Удалить все данные кроме raw/ (с --clean)",
+    )
+
     args = parser.parse_args()
 
     # Проверяем, что хотя бы что-то указано
     management_cmd = bool(args.new_project or args.list_projects or args.delete_project)
-    pipeline_flags = any(getattr(args, s, False)
-                         for s in ["all", "load", "annotate", "augment", "balance", "export"])
+    # from_step и clean-модификаторы учитываются как pipeline-флаги,
+    # чтобы при неверном сочетании аргументов пользователь получал ошибку, а не справку
+    pipeline_flags = (
+        any(getattr(args, s, False)
+            for s in ["all", "load", "annotate", "augment", "balance", "export", "clean"])
+        or bool(args.from_step)
+        or bool(args.frames or args.processed or args.all_data)
+    )
 
     if not management_cmd and not pipeline_flags:
         parser.print_help()
         sys.exit(0)
 
-    # Шаги пайплайна требуют --project
+    # Шаги пайплайна и очистка требуют --project
     if pipeline_flags and not args.project:
         parser.error(
             "Укажите проект: --project \"название\"\n"
             "Список проектов: python main.py --list-projects"
         )
 
-    # --from имеет смысл только с --all
-    if args.from_step and not args.all:
-        parser.error("--from используется только вместе с --all")
+    # --from: проверяем допустимость значения и совместимость с --all
+    if args.from_step is not None:
+        if args.from_step not in PIPELINE_STEPS:
+            valid = ", ".join(PIPELINE_STEPS)
+            parser.error(f"Неверный шаг '{args.from_step}'. Допустимые: {valid}")
+        if not args.all:
+            parser.error("--from используется только вместе с --all")
+
+    # --frames / --processed / --all-data имеют смысл только вместе с --clean
+    if (args.frames or args.processed or args.all_data) and not args.clean:
+        parser.error("--frames, --processed и --all-data используются только вместе с --clean")
+
+    # Нельзя указывать несколько уровней очистки одновременно
+    if args.clean and sum([args.frames, args.processed, args.all_data]) > 1:
+        parser.error("Укажите только один из: --frames, --processed, --all-data")
 
     return args
 
@@ -432,7 +630,7 @@ def main() -> None:
         return
 
     # -----------------------------------------------------------------------
-    # Пайплайн — загружаем проект
+    # Пайплайн и очистка — загружаем проект
     # -----------------------------------------------------------------------
 
     try:
@@ -441,7 +639,33 @@ def main() -> None:
         print(f"Ошибка: {exc}")
         sys.exit(1)
 
-    # Определяем список шагов для запуска
+    # Единый лог-файл запуска — все модули пишут сюда через корневой логгер
+    setup_run_log(project.logs_dir)
+
+    # -----------------------------------------------------------------------
+    # Очистка данных проекта
+    # -----------------------------------------------------------------------
+
+    if args.clean:
+        # Определяем уровень очистки из флагов; None → интерактивное меню
+        level = None
+        if args.frames:
+            level = "frames"
+        elif args.processed:
+            level = "processed"
+        elif args.all_data:
+            level = "all_data"
+
+        try:
+            _cmd_clean_project(project, level)
+        except KeyboardInterrupt:
+            print("\nПрервано.")
+        return
+
+    # -----------------------------------------------------------------------
+    # Запуск шагов пайплайна
+    # -----------------------------------------------------------------------
+
     if args.all:
         if args.from_step:
             # Явно указан стартовый шаг через --from
@@ -466,10 +690,6 @@ def main() -> None:
     # Заголовок
     print(BANNER)
     logger.info(f"Проект: '{project.name}' | шаги: {steps}")
-
-    # -----------------------------------------------------------------------
-    # Выполнение шагов
-    # -----------------------------------------------------------------------
 
     for idx, step in enumerate(steps, start=1):
         _step_header(idx, total_steps, STEP_NAMES[step])
@@ -507,10 +727,7 @@ def main() -> None:
         print(f"   Готово за {_fmt_duration(elapsed)}")
         logger.info(f"Шаг '{step}' завершён за {_fmt_duration(elapsed)}")
 
-    # -----------------------------------------------------------------------
     # Итоговый отчёт (только для --all)
-    # -----------------------------------------------------------------------
-
     if args.all:
         _print_report(project, results, time.time() - pipeline_start)
 
