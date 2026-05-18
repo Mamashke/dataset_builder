@@ -383,36 +383,67 @@ AUGMENTATIONS = {
 # Вспомогательные функции для augment_dataset
 # ---------------------------------------------------------------------------
 
-def _collect_source_frames(source_dir: Path) -> List[Path]:
-    """Собирает оригинальные кадры из папки источника.
+def _collect_source_frames(project: Project, sources: list) -> List[tuple]:
+    """Собирает оригинальные кадры из источников проекта через data_sources.
 
-    Исключает файлы, которые сами являются результатом аугментации
-    (их имя заканчивается на _fog, _rain, _noise, _blur, _brightness).
-    Это важно при повторных запусках — чтобы не аугментировать аугментации.
+    Для каждого источника:
+      - входная папка берётся из project.get_source("frames", source);
+      - если путь не задан — источник пропускается с сообщением;
+      - выходная папка всегда project.frames_real_dir / frames_airsim_dir.
+
+    Файлы, уже являющиеся результатом аугментации (_fog, _rain и т.д.),
+    исключаются, чтобы не аугментировать аугментации при повторных запусках.
 
     Args:
-        source_dir: папка с кадрами одного источника (real или airsim).
+        project: объект Project — входные пути читаются через data_sources.
+        sources: список имён источников ("real", "airsim").
 
     Returns:
-        Отсортированный список путей к оригинальным кадрам.
+        Список кортежей (frame_path, output_dir, source_name):
+          frame_path  — путь к оригинальному кадру во входной папке;
+          output_dir  — папка проекта, куда сохранять результат;
+          source_name — "real" или "airsim".
     """
+    output_dirs = {
+        "real":   project.frames_real_dir,
+        "airsim": project.frames_airsim_dir,
+    }
     suffixes = set(AUGMENTATIONS.keys())
-    frames = []
+    result = []
 
-    for p in sorted(source_dir.iterdir()):
-        if p.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+    for source in sources:
+        # Входная папка берётся из data_sources — может быть внешней
+        input_dir = project.get_source("frames", source)
+
+        if input_dir is None:
+            print(f"Путь к кадрам не задан для источника '{source}' — пропускаем")
+            logger.info(f"Путь к кадрам не задан для источника '{source}' — пропускаем")
             continue
 
-        # Проверяем, не является ли файл уже аугментированной копией.
-        # Оригинальные файлы имеют формат: {source}_{video}_frame_{N}.ext
-        # Аугментированные: {source}_{video}_frame_{N}_{aug_type}.ext
-        stem_parts = p.stem.rsplit("_", 1)
-        if len(stem_parts) == 2 and stem_parts[-1] in suffixes:
-            continue  # пропускаем аугментированные копии
+        if not input_dir.exists():
+            logger.warning(
+                f"Папка с кадрами не найдена: {input_dir} — пропускаем '{source}'"
+            )
+            continue
 
-        frames.append(p)
+        output_dir = output_dirs.get(source, project.frames_real_dir)
 
-    return frames
+        frames = []
+        for p in sorted(input_dir.iterdir()):
+            if p.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+                continue
+            # Пропускаем файлы, уже являющиеся результатом аугментации
+            stem_parts = p.stem.rsplit("_", 1)
+            if len(stem_parts) == 2 and stem_parts[-1] in suffixes:
+                continue
+            frames.append(p)
+
+        for frame_path in frames:
+            result.append((frame_path, output_dir, source))
+
+        logger.info(f"Источник '{source}': {len(frames)} кадров → {output_dir}")
+
+    return result
 
 
 def _find_annotation(
@@ -506,13 +537,12 @@ def augment_dataset(
     # Убираем дубликаты, сохраняя порядок
     augmentation_types = list(dict.fromkeys(augmentation_types))
 
-    # Карта источников: имя → папка с кадрами (из объекта project)
-    sources_map = {
-        "real":   project.frames_real_dir,
-        "airsim": project.frames_airsim_dir,
-    }
-    if sources is not None:
-        sources_map = {k: v for k, v in sources_map.items() if k in sources}
+    # Определяем активные источники с учётом фильтра sources
+    active_sources = (
+        [s for s in ("real", "airsim") if s in sources]
+        if sources is not None
+        else ["real", "airsim"]
+    )
 
     logger.info("=" * 50)
     logger.info(
@@ -526,18 +556,36 @@ def augment_dataset(
     skipped = 0           # пропущено (уже существуют, overwrite=False)
     errors = 0            # ошибок при чтении/записи
 
-    for source_name, frames_dir in sources_map.items():
-        if not frames_dir.exists():
-            logger.warning(f"Папка источника не найдена: {frames_dir} — пропускаем '{source_name}'")
-            continue
+    # Собираем кадры через data_sources; каждый элемент — (frame_path, output_dir, source)
+    all_frames = _collect_source_frames(project, active_sources)
 
-        original_frames = _collect_source_frames(frames_dir)
+    if not all_frames:
+        logger.warning("Кадры не найдены ни в одном источнике.")
+        return {"processed_frames": 0, "created": 0, "skipped": 0, "errors": 0}
 
-        if not original_frames:
-            logger.warning(f"Источник '{source_name}': оригинальные кадры не найдены в {frames_dir}")
-            continue
+    # Группируем по источнику для per-source статистики и set_source
+    frames_by_source: dict = {}
+    source_output_dirs: dict = {}
+    for frame_path, output_dir, source_name in all_frames:
+        frames_by_source.setdefault(source_name, []).append(frame_path)
+        source_output_dirs[source_name] = output_dir
+
+    for source_name, original_frames in frames_by_source.items():
+        output_dir = source_output_dirs[source_name]
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Путь к аннотациям берём из data_sources; None → копирование пропускается
+        ann_dir = project.get_source("annotations", source_name)
+        if ann_dir is None:
+            logger.info(
+                f"Источник '{source_name}': путь к аннотациям не задан — "
+                "копирование аннотаций пропускается"
+            )
 
         logger.info(f"Источник '{source_name}': {len(original_frames)} оригинальных кадров")
+
+        source_created = 0
+        source_skipped = 0
 
         for frame_path in original_frames:
             # Читаем изображение через _imread (поддержка кириллики в пути)
@@ -549,43 +597,56 @@ def augment_dataset(
 
             processed_frames += 1
 
-            # Ищем соответствующий файл разметки в папке аннотаций проекта
-            ann_src = _find_annotation(frame_path, project.annotations_dir, sources_map)
+            # Ищем txt-аннотацию для кадра в папке аннотаций источника
+            ann_src = None
+            if ann_dir is not None:
+                candidate = ann_dir / (frame_path.stem + ".txt")
+                if candidate.exists():
+                    ann_src = candidate
+
+            # Ресайз оригинала и сохранение в папку проекта (сжатый оригинал без суффикса)
+            if config.AUGMENT_RESIZE:
+                orig_resized = cv2.resize(
+                    image,
+                    (config.TARGET_WIDTH, config.TARGET_HEIGHT),
+                    interpolation=cv2.INTER_AREA,
+                )
+            else:
+                orig_resized = image.copy()
+
+            orig_dst = output_dir / f"{frame_path.stem}.jpg"
+            if not orig_dst.exists() or overwrite:
+                _imwrite(orig_dst, orig_resized, quality=config.AUGMENT_QUALITY)
 
             for aug_type in augmentation_types:
-                # Формируем имя нового файла: оригинальное_имя + _тип.jpg
+                # Имя аугментированного файла: оригинальное_имя + _тип.jpg
                 aug_stem = f"{frame_path.stem}_{aug_type}"
-                aug_path = frame_path.parent / f"{aug_stem}.jpg"
+                aug_path = output_dir / f"{aug_stem}.jpg"
 
-                image_exists = aug_path.exists()
-
-                # Пропускаем картинку, если она уже создана и перезапись не нужна
-                if image_exists and not overwrite:
+                if aug_path.exists() and not overwrite:
                     skipped += 1
+                    source_skipped += 1
                 else:
                     try:
-                        aug_func  = AUGMENTATIONS[aug_type]
-                        # Аугментация на оригинальном разрешении — параметры дождя
-                        # и других эффектов масштабируются под реальный размер кадра
+                        aug_func = AUGMENTATIONS[aug_type]
+                        # Аугментация на оригинальном разрешении
                         aug_image = aug_func(image, intensity)
-                        # Ресайз после аугментации — сохраняем в целевое разрешение
+                        # Ресайз после аугментации — в целевое разрешение
                         if config.AUGMENT_RESIZE:
                             aug_image = cv2.resize(
                                 aug_image,
                                 (config.TARGET_WIDTH, config.TARGET_HEIGHT),
                                 interpolation=cv2.INTER_AREA,
                             )
-
                         _imwrite(aug_path, aug_image, quality=config.AUGMENT_QUALITY)
                         created += 1
+                        source_created += 1
                     except Exception as exc:
                         logger.error(f"Ошибка при '{aug_type}' для {frame_path.name}: {exc}")
                         errors += 1
                         continue
 
-                # Копируем txt разметки независимо от того, была ли картинка создана
-                # сейчас или уже существовала — это позволяет «дополнить» ранее
-                # созданные аугментации недостающими аннотациями.
+                # Копируем txt разметки (координаты не меняются при пиксельных аугментациях)
                 if ann_src is not None:
                     ann_dst = ann_src.parent / f"{aug_stem}.txt"
                     if not ann_dst.exists() or overwrite:
@@ -597,8 +658,11 @@ def augment_dataset(
         logger.info(
             f"Источник '{source_name}' завершён: "
             f"кадров={len(original_frames)}, "
-            f"создано={created}, пропущено={skipped}"
+            f"создано={source_created}, пропущено={source_skipped}"
         )
+
+        # Фиксируем путь к кадрам проекта в data_sources
+        project.set_source("frames", source_name, output_dir)
 
     # Итоговый отчёт
     stats = {

@@ -197,20 +197,20 @@ def load_videos(
         ValueError:        если source не входит в допустимые значения.
         FileNotFoundError: если папка с исходными видео не существует.
     """
-    # Подключаем файловый лог проекта — все записи logger в этом модуле
-    # (включая вызовы из _extract_frames) попадут в project.logs_dir/loader.log
-    get_logger(__name__, project.logs_dir)
-
     if source not in _VALID_SOURCES:
         raise ValueError(f"Неизвестный источник '{source}'. Допустимые: {list(_VALID_SOURCES)}")
 
-    # Пути берём из объекта project, а не из глобального config
-    if source == "real":
-        input_dir  = project.raw_real_dir
-        output_dir = project.frames_real_dir
-    else:
-        input_dir  = project.raw_airsim_dir
-        output_dir = project.frames_airsim_dir
+    # Путь к видео берём из data_sources проекта — задаётся при --new-project или --set-source
+    input_dir  = project.get_source("videos", source)
+    output_dir = project.frames_real_dir if source == "real" else project.frames_airsim_dir
+
+    if input_dir is None:
+        print(
+            f"Путь к видео не указан для источника '{source}'.\n"
+            f"Укажите путь: python main.py --project '{project.name}'"
+            f" --set-source videos {source} C:/path/"
+        )
+        raise SystemExit(1)
 
     if not input_dir.exists():
         raise FileNotFoundError(f"Папка с видео не найдена: {input_dir}")
@@ -248,6 +248,9 @@ def load_videos(
     )
     logger.info(f"Результат: {output_dir}")
     logger.info("=" * 50)
+
+    # Фиксируем путь к извлечённым кадрам в data_sources проекта
+    project.set_source("frames", source, output_dir)
 
     stats = {"videos": len(selected), "frames": total_frames}
     project.update_stats({"load": stats})

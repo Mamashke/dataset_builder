@@ -139,6 +139,73 @@ def _clear_dir(path: Path) -> None:
             item.unlink()
 
 
+def _ask_valid_path(prompt: str, optional: bool = False, max_attempts: int = 3):
+    """Запрашивает путь к папке, повторяя до max_attempts раз при ошибке.
+
+    Args:
+        prompt:       строка приглашения ввода.
+        optional:     если True, пустой ввод возвращает None без ошибки.
+        max_attempts: максимальное число попыток (по умолчанию 3).
+
+    Returns:
+        Path если папка существует, None если optional и ввод пустой.
+    """
+    for attempt in range(1, max_attempts + 1):
+        raw = input(prompt).strip()
+        if not raw:
+            if optional:
+                return None
+            print("  Путь не может быть пустым.")
+        else:
+            path = Path(raw)
+            if path.exists():
+                return path
+            remaining = max_attempts - attempt
+            if remaining:
+                print(f"  Папка не найдена: {path}. Осталось попыток: {remaining}.")
+            else:
+                print(f"  Папка не найдена: {path}.")
+        if attempt == max_attempts:
+            print("  Превышено число попыток. Завершение.")
+            sys.exit(1)
+    return None
+
+
+def _ask_sources(project: "Project", start_from: str) -> None:
+    """Запрашивает пути к исходным данным в зависимости от стартового шага.
+
+    Args:
+        project:    объект Project для сохранения путей через set_source().
+        start_from: стартовый шаг — "load", "annotate" или "balance".
+    """
+    print()
+    if start_from == "load":
+        p = _ask_valid_path("Укажите путь к папке с видео (real): ")
+        project.set_source("videos", "real", p)
+        p = _ask_valid_path(
+            "Укажите путь к папке с видео airsim (Enter — пропустить): ",
+            optional=True,
+        )
+        if p is not None:
+            project.set_source("videos", "airsim", p)
+
+    elif start_from == "annotate":
+        p = _ask_valid_path("Укажите путь к папке с кадрами (real): ")
+        project.set_source("frames", "real", p)
+        p = _ask_valid_path(
+            "Укажите путь к папке с кадрами airsim (Enter — пропустить): ",
+            optional=True,
+        )
+        if p is not None:
+            project.set_source("frames", "airsim", p)
+
+    elif start_from == "balance":
+        p = _ask_valid_path("Укажите путь к папке с изображениями: ")
+        project.set_source("frames", "real", p)
+        p = _ask_valid_path("Укажите путь к папке с разметкой: ")
+        project.set_source("annotations", "real", p)
+
+
 # ---------------------------------------------------------------------------
 # Команды управления проектами
 # ---------------------------------------------------------------------------
@@ -171,6 +238,9 @@ def _cmd_new_project(name: str) -> None:
     meta = project._read_meta()
     meta["start_from"] = start_from
     project._write_meta(meta)
+
+    # Запрашиваем пути к исходным данным для выбранного сценария
+    _ask_sources(project, start_from)
 
     logger.info(f"Проект '{name}' создан, start_from='{start_from}'")
     print(f"\nГотово! Начало работы: с шага «{STEP_NAMES[start_from]}».")
@@ -361,12 +431,18 @@ def step_load(project: Project) -> dict:
     Returns:
         Суммарная статистика: {"videos": N, "frames": N}.
     """
-    r_real   = load_videos(project, source="real")
-    r_airsim = load_videos(project, source="airsim")
+    empty = {"videos": 0, "frames": 0}
+    results = {}
+    for source in ("real", "airsim"):
+        if project.get_source("videos", source) is None:
+            logger.info(f"Источник '{source}' пропущен — путь не задан")
+            results[source] = empty
+            continue
+        results[source] = load_videos(project, source=source)
 
     combined = {
-        "videos": r_real["videos"] + r_airsim["videos"],
-        "frames": r_real["frames"] + r_airsim["frames"],
+        "videos": results["real"]["videos"] + results["airsim"]["videos"],
+        "frames": results["real"]["frames"] + results["airsim"]["frames"],
     }
     # Перезаписываем суммарной статистикой — каждый вызов load_videos()
     # сохранил только свой источник, нам нужна сумма по обоим

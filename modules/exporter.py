@@ -214,9 +214,9 @@ def export(project: Project, format: str = "yolo") -> dict:
     logger.info(f"Exporter | project={project.name} | формат={format}")
     logger.info("=" * 50)
 
-    # Пути к датасету и выходной папке берём из проекта
-    images_dir = project.dataset_images_dir
-    labels_dir = project.dataset_labels_dir
+    # Пути к датасету берём из data_sources; если не задан — fallback на фиксированный путь
+    images_dir = project.get_source("dataset", "images") or project.dataset_images_dir
+    labels_dir = project.get_source("dataset", "labels") or project.dataset_labels_dir
     out_dir    = project.export_dir / format
 
     if format == "yolo":

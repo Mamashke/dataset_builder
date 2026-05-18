@@ -59,23 +59,16 @@ def _collect_frames(project: Project, sources: list) -> list:
     Returns:
         Список пар (frame_path, ann_dir).
     """
-    # Маппинг: имя источника → папка с кадрами проекта
-    frames_map = {
-        "real":   project.frames_real_dir,
-        "airsim": project.frames_airsim_dir,
-    }
-
     result = []
 
     for source in sources:
-        if source not in frames_map:
-            logger.warning(
-                f"Неизвестный источник '{source}', пропускаем. "
-                f"Допустимые: {list(frames_map)}"
-            )
-            continue
+        # Путь к кадрам берём из data_sources проекта — задаётся при --new-project или load
+        frames_dir = project.get_source("frames", source)
 
-        frames_dir = frames_map[source]
+        if frames_dir is None:
+            print(f"Путь к кадрам не задан для источника '{source}' — пропускаем")
+            logger.info(f"Путь к кадрам не задан для источника '{source}' — пропускаем")
+            continue
 
         if not frames_dir.exists():
             logger.warning(
@@ -492,6 +485,10 @@ def annotate(
             logger.info(f"  {key}: {value}")
     logger.info(f"Папка аннотаций: {project.annotations_dir}")
     logger.info("=" * 50)
+
+    # Фиксируем пути к аннотациям в data_sources проекта
+    for source in sources:
+        project.set_source("annotations", source, project.annotations_dir / source)
 
     # Обновляем метаданные проекта
     project.update_step("annotate")

@@ -538,4 +538,8 @@ def build(
         "negative":       final_negatives,
     })
 
+    # Фиксируем пути к финальному датасету в data_sources проекта
+    project.set_source("dataset", "images", project.dataset_images_dir)
+    project.set_source("dataset", "labels", project.dataset_labels_dir)
+
     return report

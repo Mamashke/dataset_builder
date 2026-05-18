@@ -2,8 +2,6 @@
 #
 # Каждый проект — изолированная папка со своей структурой данных:
 #   projects/{name}/
-#       raw/real/           — исходные видеозаписи реальной камеры
-#       raw/airsim/         — видеозаписи из AirSim
 #       frames/real/        — извлечённые кадры из реальных видео
 #       frames/airsim/      — извлечённые кадры из AirSim
 #       annotations/        — файлы разметки (YOLO txt)
@@ -13,13 +11,20 @@
 #       logs/               — лог-файлы проекта
 #       project.json        — метаданные проекта
 #
+# Пути к входным данным (видео, кадры и т.д.) хранятся в data_sources и
+# могут указывать на произвольные места файловой системы — не только внутри
+# папки проекта. Управление через set_source() / get_source().
+#
 # Публичный интерфейс:
-#   Project.create(name)    — создать новый проект
-#   Project.load(name)      — загрузить существующий
-#   Project.list_all()      — список всех проектов
-#   Project.delete(name)    — удалить проект
-#   project.update_step()   — обновить текущий шаг в project.json
-#   project.update_stats()  — обновить статистику в project.json
+#   Project.create(name)          — создать новый проект
+#   Project.load(name)            — загрузить существующий
+#   Project.list_all()            — список всех проектов
+#   Project.delete(name)          — удалить проект
+#   project.set_source(cat, key, path) — задать путь в data_sources
+#   project.get_source(cat, key)  — получить путь из data_sources
+#   project.validate_sources()    — проверить доступность всех путей
+#   project.update_step()         — обновить текущий шаг в project.json
+#   project.update_stats()        — обновить статистику в project.json
 
 import json
 import re
@@ -40,6 +45,15 @@ _NAME_RE = re.compile(r'^[a-zA-Z0-9а-яА-ЯёЁ_\-]+$')
 # Имя файла метаданных внутри папки проекта
 _META_FILE = "project.json"
 
+# Пустая структура data_sources — используется при создании проекта
+# и как эталон допустимых категорий / ключей в set_source / get_source
+_DEFAULT_DATA_SOURCES: dict = {
+    "videos":      {"real": None, "airsim": None},
+    "frames":      {"real": None, "airsim": None},
+    "annotations": {"real": None, "airsim": None},
+    "dataset":     {"images": None, "labels": None},
+}
+
 
 class Project:
     """Описывает один проект и предоставляет все его пути.
@@ -57,11 +71,7 @@ class Project:
         self.name = name
         self.dir  = config.PROJECTS_DIR / name
 
-        # Исходные видеозаписи
-        self.raw_real_dir   = self.dir / "raw"    / "real"
-        self.raw_airsim_dir = self.dir / "raw"    / "airsim"
-
-        # Извлечённые кадры
+        # Извлечённые кадры (внутри папки проекта)
         self.frames_real_dir   = self.dir / "frames" / "real"
         self.frames_airsim_dir = self.dir / "frames" / "airsim"
 
@@ -75,6 +85,14 @@ class Project:
         # Экспорт и логи
         self.export_dir = self.dir / "export"
         self.logs_dir   = self.dir / "logs"
+
+        # Настраиваемые пути к источникам данных.
+        # Хранятся в project.json и могут указывать на любое место файловой системы.
+        # Инициализируем пустой структурой, затем заполняем из project.json (если он есть).
+        import copy
+        self.data_sources: dict = copy.deepcopy(_DEFAULT_DATA_SOURCES)
+        if self._meta_path.exists():
+            self._load_data_sources()
 
     # -----------------------------------------------------------------------
     # Внутренние утилиты
@@ -96,11 +114,23 @@ class Project:
             encoding="utf-8",
         )
 
+    def _load_data_sources(self) -> None:
+        """Загружает data_sources из project.json в self.data_sources."""
+        meta = self._read_meta()
+        saved = meta.get("data_sources", {})
+        for cat, keys in saved.items():
+            if cat in self.data_sources and isinstance(keys, dict):
+                for key, val in keys.items():
+                    if key in self.data_sources[cat]:
+                        self.data_sources[cat][key] = Path(val) if val is not None else None
+
     def _create_dirs(self) -> None:
-        """Создаёт все папки структуры проекта."""
+        """Создаёт все рабочие папки структуры проекта.
+
+        raw/ не создаётся — исходные видео могут лежать в произвольном месте
+        и регистрируются через set_source("videos", ...).
+        """
         dirs = [
-            self.raw_real_dir,
-            self.raw_airsim_dir,
             self.frames_real_dir,
             self.frames_airsim_dir,
             self.annotations_dir,
@@ -172,11 +202,13 @@ class Project:
         # Создаём папки и сохраняем метаданные
         project._create_dirs()
 
+        import copy
         meta = {
             "name":         name,
             "created":      datetime.now().isoformat(timespec="seconds"),
             "current_step": None,
             "stats":        {},
+            "data_sources": copy.deepcopy(_DEFAULT_DATA_SOURCES),
         }
         project._write_meta(meta)
 
@@ -279,6 +311,88 @@ class Project:
                 print("Удаление отменено.")
                 return
             print("  Введите 'yes' или 'no'.")
+
+    # -----------------------------------------------------------------------
+    # Управление источниками данных
+    # -----------------------------------------------------------------------
+
+    def set_source(self, category: str, key: str, path) -> None:
+        """Задаёт путь в data_sources и сохраняет его в project.json.
+
+        Args:
+            category: категория ("videos", "frames", "annotations", "dataset").
+            key:      ключ внутри категории ("real", "airsim", "images", "labels").
+            path:     путь к источнику данных (str или Path) или None для сброса.
+
+        Raises:
+            KeyError: если category или key не существуют в _DEFAULT_DATA_SOURCES.
+        """
+        if category not in _DEFAULT_DATA_SOURCES:
+            raise KeyError(
+                f"Неизвестная категория '{category}'. "
+                f"Допустимые: {', '.join(_DEFAULT_DATA_SOURCES)}"
+            )
+        if key not in _DEFAULT_DATA_SOURCES[category]:
+            raise KeyError(
+                f"Неизвестный ключ '{key}' в категории '{category}'. "
+                f"Допустимые: {', '.join(_DEFAULT_DATA_SOURCES[category])}"
+            )
+
+        self.data_sources[category][key] = Path(path) if path is not None else None
+
+        meta = self._read_meta()
+        if "data_sources" not in meta:
+            import copy
+            meta["data_sources"] = copy.deepcopy(_DEFAULT_DATA_SOURCES)
+        if category not in meta["data_sources"]:
+            meta["data_sources"][category] = {}
+        meta["data_sources"][category][key] = str(path) if path is not None else None
+        self._write_meta(meta)
+        logger.info(f"Проект '{self.name}': data_sources[{category}][{key}] → {path}")
+
+    def get_source(self, category: str, key: str) -> Optional[Path]:
+        """Возвращает путь из data_sources или None, если не задан.
+
+        Args:
+            category: категория ("videos", "frames", "annotations", "dataset").
+            key:      ключ внутри категории.
+
+        Returns:
+            Path или None.
+
+        Raises:
+            KeyError: если category или key не существуют в _DEFAULT_DATA_SOURCES.
+        """
+        if category not in _DEFAULT_DATA_SOURCES:
+            raise KeyError(
+                f"Неизвестная категория '{category}'. "
+                f"Допустимые: {', '.join(_DEFAULT_DATA_SOURCES)}"
+            )
+        if key not in _DEFAULT_DATA_SOURCES[category]:
+            raise KeyError(
+                f"Неизвестный ключ '{key}' в категории '{category}'. "
+                f"Допустимые: {', '.join(_DEFAULT_DATA_SOURCES[category])}"
+            )
+        return self.data_sources[category][key]
+
+    def validate_sources(self) -> bool:
+        """Проверяет существование всех непустых путей в data_sources.
+
+        Returns:
+            True, если все заданные пути существуют; False, если есть недоступные.
+        """
+        ok = True
+        for category, keys in self.data_sources.items():
+            for key, path in keys.items():
+                if path is None:
+                    continue
+                if not Path(path).exists():
+                    logger.warning(
+                        f"Проект '{self.name}': путь недоступен — "
+                        f"data_sources[{category}][{key}] = {path}"
+                    )
+                    ok = False
+        return ok
 
     # -----------------------------------------------------------------------
     # Методы обновления метаданных
