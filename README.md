@@ -275,6 +275,40 @@ python main.py --project дрон --balance
 
 ---
 
+### Управление источниками данных
+
+Позволяет вручную задать или переопределить путь к папке с данными в уже существующем проекте. Требует `--project НАЗВАНИЕ`.
+
+```
+--set-source КАТЕГОРИЯ КЛЮЧ ПУТЬ
+```
+
+| Категория | Допустимые ключи | Описание |
+|---|---|---|
+| `videos` | `real`, `airsim` | Папка с исходными mp4-файлами |
+| `frames` | `real`, `airsim` | Папка с извлечёнными кадрами |
+| `annotations` | `real`, `airsim` | Папка с txt-файлами разметки |
+| `dataset` | `images`, `labels` | Папки финального датасета |
+
+```bash
+# Указать папку с реальными видео
+python main.py --project дрон --set-source videos real C:/videos/real/
+
+# Указать папку с кадрами AirSim
+python main.py --project дрон --set-source frames airsim C:/airsim/frames/
+
+# Переопределить папку с аннотациями
+python main.py --project дрон --set-source annotations real C:/labels/
+
+# Указать готовый датасет напрямую (пропустив шаги load/annotate/augment)
+python main.py --project дрон --set-source dataset images C:/dataset/images/
+python main.py --project дрон --set-source dataset labels C:/dataset/labels/
+```
+
+Путь сохраняется в `project.json` в поле `data_sources`. Если папка не существует — выводится ошибка и команда завершается без изменений. При неверной категории или ключе — сообщение с перечнем допустимых значений.
+
+---
+
 ### Очистка данных проекта
 
 `raw/`, `project.json` и `logs/` никогда не удаляются.

@@ -550,6 +550,37 @@ def _print_report(project: Project, results: dict, total_seconds: float) -> None
 
 
 # ---------------------------------------------------------------------------
+# Управление источниками данных
+# ---------------------------------------------------------------------------
+
+def _cmd_set_source(project: Project, category: str, key: str, path_str: str) -> None:
+    """Задаёт путь к источнику данных проекта и сохраняет его в project.json.
+
+    Args:
+        project:   объект Project.
+        category:  категория источника ("videos", "frames", "annotations", "dataset").
+        key:       ключ внутри категории ("real", "airsim", "images", "labels").
+        path_str:  путь к папке с данными.
+    """
+    path = Path(path_str)
+
+    # Проверяем существование папки до обращения к project.set_source
+    if not path.exists():
+        print(f"Ошибка: папка не найдена: {path}")
+        sys.exit(1)
+
+    try:
+        project.set_source(category, key, path)
+    except KeyError as exc:
+        # project.set_source выбрасывает KeyError при неверной категории или ключе
+        print(f"Ошибка: {exc}")
+        sys.exit(1)
+
+    print(f"Источник обновлён: {category}.{key} = {path}")
+    logger.info(f"set_source | project={project.name} | {category}.{key} → {path}")
+
+
+# ---------------------------------------------------------------------------
 # Разбор аргументов
 # ---------------------------------------------------------------------------
 
@@ -565,6 +596,8 @@ def _parse_args() -> argparse.Namespace:
             "  python main.py --project дрон --all\n"
             "  python main.py --project дрон --all --from annotate\n"
             "  python main.py --project дрон --export --format coco\n"
+            "  python main.py --project дрон --set-source videos real C:/videos/\n"
+            "  python main.py --project дрон --set-source frames airsim C:/airsim/\n"
             "  python main.py --project дрон --clean\n"
             "  python main.py --project дрон --clean --frames\n"
             "  python main.py --project дрон --clean --all-data\n"
@@ -610,6 +643,19 @@ def _parse_args() -> argparse.Namespace:
         help="Формат экспорта: yolo или coco (используется с --export)",
     )
 
+    # Группа управления источниками данных
+    grp_src = parser.add_argument_group("Управление источниками данных (требуется --project)")
+    grp_src.add_argument(
+        "--set-source", nargs=3, metavar=("КАТЕГОРИЯ", "КЛЮЧ", "ПУТЬ"),
+        dest="set_source",
+        help=(
+            "Задать путь к источнику данных проекта. "
+            "Категории: videos, frames, annotations, dataset. "
+            "Ключи: real, airsim, images, labels. "
+            "Пример: --set-source videos real C:/videos/"
+        ),
+    )
+
     # Группа очистки данных
     grp_clean = parser.add_argument_group("Очистка данных проекта (требуется --project)")
     grp_clean.add_argument(
@@ -640,6 +686,7 @@ def _parse_args() -> argparse.Namespace:
             for s in ["all", "load", "annotate", "augment", "balance", "export", "clean"])
         or bool(args.from_step)
         or bool(args.frames or args.processed or args.all_data)
+        or bool(args.set_source)
     )
 
     if not management_cmd and not pipeline_flags:
@@ -714,6 +761,12 @@ def main() -> None:
     except FileNotFoundError as exc:
         print(f"Ошибка: {exc}")
         sys.exit(1)
+
+    # Задание источника данных — лёгкая операция, лог запуска не нужен
+    if args.set_source:
+        category, key, path_str = args.set_source
+        _cmd_set_source(project, category, key, path_str)
+        return
 
     # Единый лог-файл запуска — все модули пишут сюда через корневой логгер
     setup_run_log(project.logs_dir)
