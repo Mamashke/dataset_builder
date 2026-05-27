@@ -83,6 +83,17 @@ _CLEAN_STATS_KEYS = {
     "all_data":  None,
 }
 
+# Пути в data_sources, которые сбрасываются после каждого уровня очистки.
+# videos не сбрасывается — путь к исходным видео остаётся актуальным.
+_CLEAN_SOURCES = {
+    "frames":    [("frames", "real"), ("frames", "airsim")],
+    "processed": [("frames", "real"), ("frames", "airsim"),
+                  ("annotations", "real"), ("annotations", "airsim")],
+    "all_data":  [("frames", "real"), ("frames", "airsim"),
+                  ("annotations", "real"), ("annotations", "airsim"),
+                  ("dataset", "images"), ("dataset", "labels")],
+}
+
 
 # ---------------------------------------------------------------------------
 # Вспомогательные утилиты
@@ -137,6 +148,15 @@ def _clear_dir(path: Path) -> None:
             shutil.rmtree(item)
         else:
             item.unlink()
+
+
+def _print_data_sources(project: "Project") -> None:
+    """Выводит текущее состояние data_sources проекта после очистки."""
+    print("\nОстаток в data_sources:")
+    for cat, keys in project.data_sources.items():
+        for key, val in keys.items():
+            val_str = str(val) if val is not None else "—"
+            print(f"  {cat}.{key:<20} = {val_str}")
 
 
 def _ask_valid_path(prompt: str, optional: bool = False, max_attempts: int = 3):
@@ -386,8 +406,14 @@ def _cmd_clean_project(project: Project, level: str = None) -> None:
     meta["current_step"] = None
     project._write_meta(meta)
 
+    # Сбрасываем пути в data_sources для удалённых данных.
+    # videos не сбрасываем — путь к исходным видео по-прежнему актуален.
+    for cat, key in _CLEAN_SOURCES[level]:
+        project.set_source(cat, key, None)
+
     logger.info(f"Очистка завершена: уровень='{level}', удалено={_fmt_size(total_bytes)}")
     print(f"Готово. Удалено: {_fmt_size(total_bytes)}")
+    _print_data_sources(project)
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +604,78 @@ def _cmd_set_source(project: Project, category: str, key: str, path_str: str) ->
 
     print(f"Источник обновлён: {category}.{key} = {path}")
     logger.info(f"set_source | project={project.name} | {category}.{key} → {path}")
+
+
+# ---------------------------------------------------------------------------
+# Валидация источников данных
+# ---------------------------------------------------------------------------
+
+def _validate_step(project: Project, step: str) -> tuple:
+    """Проверяет наличие необходимых данных перед запуском шага пайплайна.
+
+    Args:
+        project: объект Project с путями к данным.
+        step:    имя шага ("load", "annotate", "augment", "balance", "export").
+
+    Returns:
+        (True, None) — проверка прошла успешно.
+        (False, "сообщение") — данных недостаточно, пайплайн не должен стартовать.
+    """
+    name = project.name
+
+    if step == "load":
+        # Нужен хотя бы один источник видео
+        if (project.get_source("videos", "real") is None and
+                project.get_source("videos", "airsim") is None):
+            return False, (
+                f"Ошибка: для шага 'load' не указан путь к видео.\n"
+                f" Укажите путь: python main.py --project '{name}'"
+                f" --set-source videos real C:/path/"
+            )
+
+    elif step == "annotate":
+        # Нужен хотя бы один источник кадров
+        if (project.get_source("frames", "real") is None and
+                project.get_source("frames", "airsim") is None):
+            return False, (
+                f"Ошибка: для шага 'annotate' не указан путь к кадрам.\n"
+                f" Укажите путь: python main.py --project '{name}'"
+                f" --set-source frames real C:/path/"
+            )
+
+    elif step == "augment":
+        # Нужен хотя бы один источник кадров
+        if (project.get_source("frames", "real") is None and
+                project.get_source("frames", "airsim") is None):
+            return False, (
+                f"Ошибка: для шага 'augment' не указан путь к кадрам.\n"
+                f" Укажите путь: python main.py --project '{name}'"
+                f" --set-source frames real C:/path/"
+            )
+
+    elif step == "balance":
+        # Папка с кадрами должна существовать и содержать файлы
+        frames_dir = project.frames_real_dir
+        if not frames_dir.exists() or not any(frames_dir.iterdir()):
+            return False, (
+                f"Ошибка: для шага 'balance' папка с кадрами пуста или не существует.\n"
+                f" Ожидается: {frames_dir}\n"
+                f" Запустите сначала шаги load и annotate."
+            )
+
+    elif step == "export":
+        # Принимаем путь из data_sources или дефолтную папку проекта (как делает export())
+        images_path = project.get_source("dataset", "images") or project.dataset_images_dir
+        if not images_path.exists() or not any(images_path.iterdir()):
+            return False, (
+                f"Ошибка: для шага 'export' датасет не найден или пуст.\n"
+                f" Ожидается: {images_path}\n"
+                f" Запустите сначала шаг balance или укажите путь:\n"
+                f" python main.py --project '{name}'"
+                f" --set-source dataset images C:/path/"
+            )
+
+    return True, None
 
 
 # ---------------------------------------------------------------------------
@@ -822,6 +920,14 @@ def main() -> None:
 
     for idx, step in enumerate(steps, start=1):
         _step_header(idx, total_steps, STEP_NAMES[step])
+
+        # Проверяем наличие нужных источников данных перед запуском шага
+        ok, err_msg = _validate_step(project, step)
+        if not ok:
+            print(f"\n{err_msg}")
+            logger.error(f"Валидация не пройдена, шаг '{step}' пропущен")
+            break
+
         t0 = time.time()
 
         try:

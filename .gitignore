@@ -1,4 +1,3 @@
-data/
 projects/
 export/
 logs/
@@ -6,6 +5,4 @@ __pycache__/
 *.pyc
 .env
 .claude/
-test_frames/
-test_rain*.jpg
-yolov8n.pt
+*.pt
