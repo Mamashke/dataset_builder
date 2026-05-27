@@ -18,6 +18,11 @@ from modules.project import Project
 
 logger = get_logger(__name__)
 
+# Глобальный перехватчик выбора видео.
+# Если задан внешним кодом (например, GUI) — вызывается вместо интерактивного меню.
+# Сигнатура: func(videos: list[Path]) -> list[Path]
+_video_selector_override = None
+
 
 # ---------------------------------------------------------------------------
 # Вспомогательная функция: извлечение кадров из одного видеофайла
@@ -101,6 +106,10 @@ def _select_videos(videos: list) -> list:
     Returns:
         Список Path-объектов, выбранных для обработки.
     """
+    # Если задан внешний перехватчик (GUI) — делегируем выбор ему
+    if _video_selector_override is not None:
+        return _video_selector_override(videos)
+
     if not videos:
         return []
 
