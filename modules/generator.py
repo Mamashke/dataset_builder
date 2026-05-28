@@ -236,9 +236,11 @@ def train_gan(
     ])
 
     dataset    = _DroneFrameDataset(all_images, transform)
+    # num_workers=0 — однопоточная загрузка: на Windows вызов из QThread с
+    # num_workers>0 использует spawn и может зависнуть внутри Qt-приложения
     dataloader = DataLoader(
         dataset, batch_size=batch_size, shuffle=True,
-        num_workers=4, pin_memory=True, drop_last=True,
+        num_workers=0, drop_last=True,
     )
 
     # Инициализация моделей и весов
@@ -263,6 +265,7 @@ def train_gan(
 
     loss_g_last = 0.0
     loss_d_last = 0.0
+    last_epoch  = 0   # фактически завершённых эпох (может быть < epochs при стопе)
 
     for epoch in range(1, epochs + 1):
         epoch_loss_g = 0.0
@@ -328,25 +331,31 @@ def train_gan(
                 f"сэмпл → {sample_path.name}"
             )
 
-        # Уведомляем внешний наблюдатель (например GUI) после каждой эпохи
-        if on_epoch:
-            on_epoch(epoch, epochs, loss_g_last, loss_d_last)
+        last_epoch = epoch
 
-    # Сохраняем веса обеих моделей
+        # Уведомляем внешний наблюдатель после каждой эпохи.
+        # Если колбэк вернул True — запрошена досрочная остановка; выходим из цикла,
+        # но веса всё равно сохраняем ниже — прогресс не теряется.
+        if on_epoch and on_epoch(epoch, epochs, loss_g_last, loss_d_last):
+            logger.info(f"Обучение GAN остановлено по запросу на эпохе {epoch}/{epochs}")
+            print(f"Обучение остановлено на эпохе {epoch}/{epochs}.")
+            break
+
+    # Сохраняем веса обеих моделей (в том числе при досрочной остановке)
     torch.save(G.state_dict(), project.gan_model_dir / "generator.pth")
     torch.save(D.state_dict(), project.gan_model_dir / "discriminator.pth")
     logger.info(f"Веса сохранены в {project.gan_model_dir}")
     print(f"Обучение завершено. Веса → {project.gan_model_dir}")
 
     project.update_stats({
-        "gan_epochs":  epochs,
+        "gan_epochs":  last_epoch,
         "gan_frames":  len(all_images),
         "gan_loss_g":  round(loss_g_last, 4),
         "gan_loss_d":  round(loss_d_last, 4),
     })
 
     return {
-        "epochs":       epochs,
+        "epochs":       last_epoch,   # фактическое число эпох (< epochs при стопе)
         "final_loss_g": round(loss_g_last, 4),
         "final_loss_d": round(loss_d_last, 4),
     }

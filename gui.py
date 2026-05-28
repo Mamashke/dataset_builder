@@ -329,14 +329,22 @@ class GanTrainWorker(QThread):
 
     def __init__(self, project: Project, epochs: int):
         super().__init__()
-        self.project = project
-        self.epochs  = epochs
+        self.project          = project
+        self.epochs           = epochs
+        # Флаг досрочной остановки — GUI устанавливает через stop()
+        self._stop_requested: bool = False
+
+    def stop(self) -> None:
+        """Запрашивает остановку после текущей эпохи. Веса будут сохранены."""
+        self._stop_requested = True
 
     def run(self) -> None:
         from modules.generator import train_gan
 
-        def _on_epoch(epoch: int, total: int, loss_g: float, loss_d: float) -> None:
+        def _on_epoch(epoch: int, total: int, loss_g: float, loss_d: float) -> bool:
             self.epoch_done.emit(epoch, total, loss_g, loss_d)
+            # True → train_gan прервёт цикл и сохранит веса
+            return self._stop_requested
 
         try:
             result = train_gan(
@@ -899,11 +907,18 @@ class PipelineTab(QWidget):
         self.btn_train_gan.clicked.connect(self._start_gan_training)
         gan_vbox.addWidget(self.btn_train_gan)
 
-        # Прогресс обучения GAN: детерминированный (эпохи)
+        # Прогресс обучения GAN (по эпохам) + кнопка «Стоп» в одной строке
+        gan_progress_row = QHBoxLayout()
         self.gan_progress = QProgressBar()
         self.gan_progress.setRange(0, 100)
         self.gan_progress.setVisible(False)
-        gan_vbox.addWidget(self.gan_progress)
+        self.btn_stop_gan = QPushButton("■  Стоп")
+        self.btn_stop_gan.setFixedWidth(90)
+        self.btn_stop_gan.setVisible(False)
+        self.btn_stop_gan.clicked.connect(self._on_stop_gan_requested)
+        gan_progress_row.addWidget(self.gan_progress)
+        gan_progress_row.addWidget(self.btn_stop_gan)
+        gan_vbox.addLayout(gan_progress_row)
 
         self.lbl_gan_status = QLabel("")
         self.lbl_gan_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1065,15 +1080,26 @@ class PipelineTab(QWidget):
         self.lbl_gan_status.setText("Ошибка обучения.")
         QMessageBox.critical(self, "Ошибка обучения GAN", msg)
 
+    def _on_stop_gan_requested(self) -> None:
+        """Запрашивает досрочную остановку GAN — веса сохранятся после эпохи."""
+        if self.gan_worker:
+            self.gan_worker.stop()
+            # Блокируем кнопку чтобы не нажимали повторно
+            self.btn_stop_gan.setEnabled(False)
+            self.lbl_gan_status.setText("Останавливаем после текущей эпохи...")
+
     def _set_gan_running(self, running: bool) -> None:
         """Управляет состоянием UI во время обучения GAN."""
         has_proj = self.current_project is not None
         self.btn_train_gan.setEnabled(not running and has_proj)
-        # Блокируем пайплайн чтобы не запускать оба процесса одновременно
+        # Блокируем пайплайн — нельзя запустить оба процесса одновременно
         self.btn_run_all.setEnabled(not running and has_proj)
         for btn in self.step_btns.values():
             btn.setEnabled(not running and has_proj)
         self.gan_progress.setVisible(running)
+        # Кнопка Стоп: показываем при запуске, скрываем по завершении
+        self.btn_stop_gan.setVisible(running)
+        self.btn_stop_gan.setEnabled(running)   # сброс enabled после disable при нажатии
         if running:
             self.gan_progress.setMaximum(self.spin_gan_epochs.value())
             self.gan_progress.setValue(0)
