@@ -39,10 +39,15 @@ from main import step_load
 
 PIPELINE_STEPS = ["load", "annotate", "augment", "balance", "export"]
 
+# Варианты пайплайна в зависимости от метода расширения датасета
+_PIPELINE_STEPS_AUGMENT = ["load", "annotate", "augment",  "balance", "export"]
+_PIPELINE_STEPS_GAN     = ["load", "annotate", "generate", "balance", "export"]
+
 STEP_NAMES = {
     "load":     "Загрузка видео",
     "annotate": "Разметка кадров",
     "augment":  "Аугментация",
+    "generate": "Генерация (GAN)",
     "balance":  "Балансировка",
     "export":   "Экспорт датасета",
 }
@@ -118,6 +123,8 @@ def _load_settings() -> dict:
         "annotate_sources":   "all",
         "annotate_overwrite": False,
         "export_format":      "yolo",
+        "expansion_method":   "augment",   # "augment" или "gan"
+        "gan_count":          200,          # кадров при generate
     }
     if SETTINGS_FILE.exists():
         try:
@@ -208,6 +215,7 @@ class PipelineWorker(QThread):
         annotate_mode:      str   = "auto",
         annotate_sources:   str   = "all",
         aug_types:          list  = None,
+        gan_count:          int   = 200,
     ):
         super().__init__()
         self.project            = project
@@ -220,6 +228,7 @@ class PipelineWorker(QThread):
         self.annotate_mode      = annotate_mode
         self.annotate_sources   = annotate_sources
         self.aug_types          = aug_types or ["fog", "rain", "noise", "blur", "brightness"]
+        self.gan_count          = gan_count
         # Очередь для получения ответа от GUI после показа диалога выбора видео
         self._video_queue: queue.Queue = queue.Queue()
         # Флаг остановки: GUI ставит True, воркер проверяет между шагами
@@ -282,6 +291,12 @@ class PipelineWorker(QThread):
                         intensity=self.augment_intensity,
                     )
 
+                elif step == "generate":
+                    from modules.generator import generate_images
+                    results["generate"] = generate_images(
+                        self.project, count=self.gan_count
+                    )
+
                 elif step == "balance":
                     results["balance"] = balance_build(self.project, overwrite=True)
 
@@ -298,6 +313,38 @@ class PipelineWorker(QThread):
         # Снимаем перехватчик после завершения всех шагов
         _loader_module._video_selector_override = None
         self.finished.emit(results)
+
+
+# ─────────────────────────────────────────────────────────────
+# Рабочий поток обучения GAN
+# ─────────────────────────────────────────────────────────────
+
+class GanTrainWorker(QThread):
+    """Запускает train_gan() в фоновом потоке и транслирует прогресс в GUI."""
+
+    # (текущая_эпоха, всего_эпох, loss_G, loss_D)
+    epoch_done = pyqtSignal(int, int, float, float)
+    finished   = pyqtSignal(dict)
+    error      = pyqtSignal(str)
+
+    def __init__(self, project: Project, epochs: int):
+        super().__init__()
+        self.project = project
+        self.epochs  = epochs
+
+    def run(self) -> None:
+        from modules.generator import train_gan
+
+        def _on_epoch(epoch: int, total: int, loss_g: float, loss_d: float) -> None:
+            self.epoch_done.emit(epoch, total, loss_g, loss_d)
+
+        try:
+            result = train_gan(
+                self.project, epochs=self.epochs, on_epoch=_on_epoch
+            )
+            self.finished.emit(result)
+        except Exception as exc:
+            self.error.emit(str(exc))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -765,6 +812,10 @@ class PipelineTab(QWidget):
         self.settings        = settings
         self.current_project = None
         self.worker          = None
+        self.gan_worker      = None
+
+        # Активный набор шагов пайплайна — меняется при смене метода расширения
+        self._active_steps = list(_PIPELINE_STEPS_AUGMENT)
 
         root = QVBoxLayout(self)
 
@@ -788,28 +839,30 @@ class PipelineTab(QWidget):
         fmt_row.addStretch()
         root.addLayout(fmt_row)
 
-        # Отдельные шаги
+        # Отдельные шаги — кнопки для обоих вариантов пайплайна
         grp_steps = QGroupBox("Отдельные шаги")
         steps_row = QHBoxLayout(grp_steps)
         self.step_btns: dict[str, QPushButton] = {}
-        for step in PIPELINE_STEPS:
+        _all_step_keys = ["load", "annotate", "augment", "generate", "balance", "export"]
+        for step in _all_step_keys:
             btn = QPushButton(STEP_NAMES[step])
             btn.setEnabled(False)
             btn.clicked.connect(lambda _checked, s=step: self._run_steps([s]))
             self.step_btns[step] = btn
             steps_row.addWidget(btn)
+        # "generate" скрыт до переключения в GAN-режим
+        self.step_btns["generate"].setVisible(False)
         root.addWidget(grp_steps)
 
         # Запуск всего пайплайна
-        grp_all = QGroupBox("Запустить весь пайплайн")
+        grp_all  = QGroupBox("Запустить весь пайплайн")
         all_vbox = QVBoxLayout(grp_all)
 
         from_row = QHBoxLayout()
         from_row.addWidget(QLabel("Начиная с шага:"))
         self.combo_from = QComboBox()
-        for s in PIPELINE_STEPS:
-            self.combo_from.addItem(STEP_NAMES[s], s)
         self.combo_from.setFixedWidth(200)
+        self._update_combo_from()   # заполняем по _active_steps
         from_row.addWidget(self.combo_from)
         from_row.addStretch()
         all_vbox.addLayout(from_row)
@@ -824,7 +877,41 @@ class PipelineTab(QWidget):
         all_vbox.addWidget(self.btn_run_all)
         root.addWidget(grp_all)
 
-        # Прогресс-бар (indeterminate) + кнопка Стоп в одной строке
+        # ── Блок обучения GAN (показывается только в GAN-режиме) ────────
+        self.grp_gan = QGroupBox("Обучение GAN")
+        self.grp_gan.setVisible(False)
+        gan_vbox = QVBoxLayout(self.grp_gan)
+
+        gan_params_row = QHBoxLayout()
+        gan_params_row.addWidget(QLabel("Эпох:"))
+        self.spin_gan_epochs = QSpinBox()
+        self.spin_gan_epochs.setRange(1, 1000)
+        self.spin_gan_epochs.setValue(100)
+        self.spin_gan_epochs.setFixedWidth(80)
+        self.spin_gan_epochs.setToolTip("Количество эпох обучения GAN")
+        gan_params_row.addWidget(self.spin_gan_epochs)
+        gan_params_row.addStretch()
+        gan_vbox.addLayout(gan_params_row)
+
+        self.btn_train_gan = QPushButton("▶  Обучить GAN")
+        self.btn_train_gan.setEnabled(False)
+        self.btn_train_gan.setMinimumHeight(36)
+        self.btn_train_gan.clicked.connect(self._start_gan_training)
+        gan_vbox.addWidget(self.btn_train_gan)
+
+        # Прогресс обучения GAN: детерминированный (эпохи)
+        self.gan_progress = QProgressBar()
+        self.gan_progress.setRange(0, 100)
+        self.gan_progress.setVisible(False)
+        gan_vbox.addWidget(self.gan_progress)
+
+        self.lbl_gan_status = QLabel("")
+        self.lbl_gan_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        gan_vbox.addWidget(self.lbl_gan_status)
+
+        root.addWidget(self.grp_gan)
+
+        # Прогресс-бар пайплайна (indeterminate) + кнопка Стоп
         progress_row = QHBoxLayout()
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
@@ -851,6 +938,7 @@ class PipelineTab(QWidget):
         for btn in self.step_btns.values():
             btn.setEnabled(has)
         self.btn_run_all.setEnabled(has)
+        self.btn_train_gan.setEnabled(has)
 
         if project:
             meta   = project._read_meta()
@@ -884,6 +972,7 @@ class PipelineTab(QWidget):
             "annotate_sources":   self.settings.get("annotate_sources", "all"),
             "aug_types":          self.settings.get(
                 "aug_types", ["fog", "rain", "noise", "blur", "brightness"]),
+            "gan_count":          self.settings.get("gan_count", 200),
         }
 
     def _run_steps(self, steps: list) -> None:
@@ -905,8 +994,90 @@ class PipelineTab(QWidget):
         if not self.current_project:
             return
         start = self.combo_from.currentData()
-        steps = PIPELINE_STEPS[PIPELINE_STEPS.index(start):]
-        self._run_steps(steps)
+        # Ищем стартовый шаг в активном пайплайне
+        try:
+            idx = self._active_steps.index(start)
+        except ValueError:
+            idx = 0
+        self._run_steps(self._active_steps[idx:])
+
+    # ── вспомогательные методы ──────────────────────────────
+
+    def _update_combo_from(self) -> None:
+        """Перестраивает комбобокс 'Начиная с шага' по текущему _active_steps."""
+        current = self.combo_from.currentData() if self.combo_from.count() else None
+        self.combo_from.clear()
+        for s in self._active_steps:
+            self.combo_from.addItem(STEP_NAMES[s], s)
+        # Восстанавливаем предыдущий выбор если шаг есть в новом списке
+        for i in range(self.combo_from.count()):
+            if self.combo_from.itemData(i) == current:
+                self.combo_from.setCurrentIndex(i)
+                break
+
+    def _on_expansion_method_changed(self, method: str) -> None:
+        """Переключает пайплайн и UI между режимами 'augment' и 'gan'."""
+        is_gan = (method == "gan")
+        self._active_steps = list(_PIPELINE_STEPS_GAN if is_gan else _PIPELINE_STEPS_AUGMENT)
+        self._update_combo_from()
+        # Показываем кнопку нужного шага расширения
+        self.step_btns["augment"].setVisible(not is_gan)
+        self.step_btns["generate"].setVisible(is_gan)
+        # Блок обучения GAN — только в GAN-режиме
+        self.grp_gan.setVisible(is_gan)
+
+    # ── обучение GAN ────────────────────────────────────────
+
+    def _start_gan_training(self) -> None:
+        """Запускает обучение GAN в отдельном потоке (независимо от пайплайна)."""
+        if not self.current_project:
+            return
+        self._set_gan_running(True)
+        self.gan_worker = GanTrainWorker(
+            self.current_project, self.spin_gan_epochs.value()
+        )
+        self.gan_worker.epoch_done.connect(self._on_gan_epoch_done)
+        self.gan_worker.finished.connect(self._on_gan_finished)
+        self.gan_worker.error.connect(self._on_gan_error)
+        self.gan_worker.start()
+
+    def _on_gan_epoch_done(self, epoch: int, total: int, loss_g: float, loss_d: float) -> None:
+        """Обновляет прогресс GAN-обучения после каждой эпохи."""
+        self.gan_progress.setMaximum(total)
+        self.gan_progress.setValue(epoch)
+        self.lbl_gan_status.setText(
+            f"Эпоха {epoch}/{total} | loss_G={loss_g:.4f} | loss_D={loss_d:.4f}"
+        )
+
+    def _on_gan_finished(self, result: dict) -> None:
+        """Вызывается по завершении обучения GAN."""
+        self._set_gan_running(False)
+        epochs = result.get("epochs", 0)
+        loss_g = result.get("final_loss_g", 0.0)
+        loss_d = result.get("final_loss_d", 0.0)
+        self.lbl_gan_status.setText(
+            f"Обучено {epochs} эпох | loss_G={loss_g:.4f} | loss_D={loss_d:.4f}"
+        )
+
+    def _on_gan_error(self, msg: str) -> None:
+        """Обработчик ошибки обучения GAN."""
+        self._set_gan_running(False)
+        self.lbl_gan_status.setText("Ошибка обучения.")
+        QMessageBox.critical(self, "Ошибка обучения GAN", msg)
+
+    def _set_gan_running(self, running: bool) -> None:
+        """Управляет состоянием UI во время обучения GAN."""
+        has_proj = self.current_project is not None
+        self.btn_train_gan.setEnabled(not running and has_proj)
+        # Блокируем пайплайн чтобы не запускать оба процесса одновременно
+        self.btn_run_all.setEnabled(not running and has_proj)
+        for btn in self.step_btns.values():
+            btn.setEnabled(not running and has_proj)
+        self.gan_progress.setVisible(running)
+        if running:
+            self.gan_progress.setMaximum(self.spin_gan_epochs.value())
+            self.gan_progress.setValue(0)
+            self.lbl_gan_status.setText("Обучение GAN...")
 
     # ── управление состоянием UI ────────────────────────────
 
@@ -990,6 +1161,9 @@ class PipelineTab(QWidget):
 
 class SettingsTab(QWidget):
 
+    # Сигнал: метод расширения изменился ("augment" или "gan")
+    expansion_method_changed = pyqtSignal(str)
+
     def __init__(self, settings: dict, parent=None):
         super().__init__(parent)
         self.settings        = settings
@@ -1031,6 +1205,27 @@ class SettingsTab(QWidget):
         btn_save_src.clicked.connect(self._save_sources)
         src_vbox.addWidget(btn_save_src)
         root.addWidget(self.grp_sources)
+
+        # ── Метод расширения датасета ────────────────────────
+        grp_method  = QGroupBox("Метод расширения датасета")
+        method_vbox = QVBoxLayout(grp_method)
+        self.r_expand_augment = QRadioButton("Аугментация")
+        self.r_expand_gan     = QRadioButton("GAN генерация")
+        if settings.get("expansion_method", "augment") == "gan":
+            self.r_expand_gan.setChecked(True)
+        else:
+            self.r_expand_augment.setChecked(True)
+        method_vbox.addWidget(self.r_expand_augment)
+        method_vbox.addWidget(self.r_expand_gan)
+
+        # Уведомляем PipelineTab немедленно при переключении (без сохранения)
+        self.r_expand_augment.toggled.connect(
+            lambda checked: self.expansion_method_changed.emit("augment") if checked else None
+        )
+        self.r_expand_gan.toggled.connect(
+            lambda checked: self.expansion_method_changed.emit("gan") if checked else None
+        )
+        root.addWidget(grp_method)
 
         # ── Параметры пайплайна ──────────────────────────────
         grp_params  = QGroupBox("Параметры пайплайна")
@@ -1195,6 +1390,8 @@ class SettingsTab(QWidget):
         else:
             ann_sources = "all"
 
+        expand_method = "gan" if self.r_expand_gan.isChecked() else "augment"
+
         self.settings.update({
             "frame_sample_rate":  self.spin_sample.value(),
             "pos_neg_ratio":      self.spin_ratio.value(),
@@ -1205,8 +1402,11 @@ class SettingsTab(QWidget):
             "annotate_mode":      ann_mode,
             "annotate_sources":   ann_sources,
             "annotate_overwrite": self.chk_overwrite.isChecked(),
+            "expansion_method":   expand_method,
         })
         _save_settings(self.settings)
+        # Сигнал уже мог уйти при переключении radio — посылаем ещё раз для надёжности
+        self.expansion_method_changed.emit(expand_method)
         QMessageBox.information(self, "Сохранено", "Настройки сохранены в gui_settings.json.")
 
 
@@ -1289,6 +1489,16 @@ class MainWindow(QMainWindow):
 
         # Завершение пайплайна → обновляем таблицу проектов
         self.tab_pipeline.pipeline_done.connect(self.tab_projects.refresh)
+
+        # Смена метода расширения в Настройках → обновляем вкладку Пайплайн
+        self.tab_settings.expansion_method_changed.connect(
+            self.tab_pipeline._on_expansion_method_changed
+        )
+
+        # Применяем сохранённый метод расширения при старте
+        self.tab_pipeline._on_expansion_method_changed(
+            self.settings.get("expansion_method", "augment")
+        )
 
     def _on_project_changed(self, project) -> None:
         self.tab_pipeline.set_project(project)

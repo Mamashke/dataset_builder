@@ -170,6 +170,7 @@ def train_gan(
     project: Project,
     epochs: int = 100,
     batch_size: int = 16,
+    on_epoch=None,
 ) -> dict:
     """Обучает DCGAN на оригинальных кадрах проекта.
 
@@ -326,6 +327,10 @@ def train_gan(
                 f"loss_G={loss_g_last:.4f} | loss_D={loss_d_last:.4f} | "
                 f"сэмпл → {sample_path.name}"
             )
+
+        # Уведомляем внешний наблюдатель (например GUI) после каждой эпохи
+        if on_epoch:
+            on_epoch(epoch, epochs, loss_g_last, loss_d_last)
 
     # Сохраняем веса обеих моделей
     torch.save(G.state_dict(), project.gan_model_dir / "generator.pth")
