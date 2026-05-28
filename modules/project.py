@@ -86,6 +86,10 @@ class Project:
         self.export_dir = self.dir / "export"
         self.logs_dir   = self.dir / "logs"
 
+        # GAN: веса обученных моделей и сэмплы промежуточных результатов
+        self.gan_model_dir   = self.dir / "gan_model"
+        self.gan_samples_dir = self.dir / "gan_samples"
+
         # Настраиваемые пути к источникам данных.
         # Хранятся в project.json и могут указывать на любое место файловой системы.
         # Инициализируем пустой структурой, затем заполняем из project.json (если он есть).
@@ -138,6 +142,8 @@ class Project:
             self.dataset_labels_dir,
             self.export_dir,
             self.logs_dir,
+            self.gan_model_dir,
+            self.gan_samples_dir,
         ]
         for d in dirs:
             d.mkdir(parents=True, exist_ok=True)

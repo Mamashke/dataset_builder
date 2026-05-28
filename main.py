@@ -58,6 +58,7 @@ STEP_NAMES = {
     "augment":  "Аугментация",
     "balance":  "Балансировка",
     "export":   "Экспорт датасета",
+    "generate": "Генерация (GAN)",
 }
 
 # Соответствие пунктов меню «С чего начать?» первому шагу пайплайна
@@ -568,6 +569,10 @@ def _print_report(project: Project, results: dict, total_seconds: float) -> None
                      if "annotations" in r else "")
         print(f"   Экспорт:      формат {fmt_label}, изображений={imgs}{anns}")
 
+    if "generate" in results:
+        r = results["generate"]
+        print(f"   GAN-генерация: создано {r.get('generated','—')} кадров")
+
     print(f"   Время работы: {_fmt_duration(total_seconds)}")
     print("================================")
 
@@ -740,6 +745,22 @@ def _parse_args() -> argparse.Namespace:
         "--format", choices=["yolo", "coco"], default=None,
         help="Формат экспорта: yolo или coco (используется с --export)",
     )
+    grp_run.add_argument(
+        "--train-gan", action="store_true", dest="train_gan",
+        help="Обучить DCGAN на оригинальных кадрах проекта",
+    )
+    grp_run.add_argument(
+        "--generate", action="store_true",
+        help="Генерировать синтетические кадры с помощью обученного GAN",
+    )
+    grp_run.add_argument(
+        "--epochs", type=int, default=100, metavar="N",
+        help="Количество эпох обучения GAN (с --train-gan, по умолчанию 100)",
+    )
+    grp_run.add_argument(
+        "--count", type=int, default=200, metavar="N",
+        help="Количество генерируемых кадров (с --generate, по умолчанию 200)",
+    )
 
     # Группа управления источниками данных
     grp_src = parser.add_argument_group("Управление источниками данных (требуется --project)")
@@ -781,7 +802,8 @@ def _parse_args() -> argparse.Namespace:
     # чтобы при неверном сочетании аргументов пользователь получал ошибку, а не справку
     pipeline_flags = (
         any(getattr(args, s, False)
-            for s in ["all", "load", "annotate", "augment", "balance", "export", "clean"])
+            for s in ["all", "load", "annotate", "augment", "balance", "export",
+                      "clean", "train_gan", "generate"])
         or bool(args.from_step)
         or bool(args.frames or args.processed or args.all_data)
         or bool(args.set_source)
@@ -890,6 +912,37 @@ def main() -> None:
         return
 
     # -----------------------------------------------------------------------
+    # GAN: обучение и генерация
+    # -----------------------------------------------------------------------
+
+    if args.train_gan:
+        from modules.generator import train_gan
+        print(BANNER)
+        print(f"\nОбучение GAN | проект: {project.name} | эпох: {args.epochs}")
+        try:
+            result = train_gan(project, epochs=args.epochs)
+            print(
+                f"\nGAN обучен за {result['epochs']} эпох | "
+                f"loss_G={result['final_loss_g']} | loss_D={result['final_loss_d']}"
+            )
+        except (FileNotFoundError, Exception) as exc:
+            print(f"Ошибка: {exc}")
+            sys.exit(1)
+        return
+
+    if args.generate:
+        from modules.generator import generate_images
+        print(BANNER)
+        print(f"\nГенерация кадров | проект: {project.name} | кадров: {args.count}")
+        try:
+            result = generate_images(project, count=args.count)
+            print(f"Готово: создано {result['generated']} кадров.")
+        except (FileNotFoundError, Exception) as exc:
+            print(f"Ошибка: {exc}")
+            sys.exit(1)
+        return
+
+    # -----------------------------------------------------------------------
     # Запуск шагов пайплайна
     # -----------------------------------------------------------------------
 
@@ -906,6 +959,16 @@ def main() -> None:
 
         start_idx = PIPELINE_STEPS.index(start_step)
         steps     = PIPELINE_STEPS[start_idx:]
+
+        # Если есть обученная GAN-модель — добавляем generate перед annotate,
+        # чтобы синтетические кадры попали в разметку и аугментацию.
+        # Обучение GAN автоматически не запускается — только generate.
+        if (project.gan_model_dir / "generator.pth").exists():
+            if "annotate" in steps:
+                steps.insert(steps.index("annotate"), "generate")
+            elif "load" in steps:
+                steps.insert(steps.index("load") + 1, "generate")
+            logger.info("Добавлен шаг 'generate' — найдена модель GAN")
     else:
         # Только шаги, явно указанные флагами
         steps = [s for s in PIPELINE_STEPS if getattr(args, s, False)]
@@ -942,6 +1005,11 @@ def main() -> None:
 
             elif step == "balance":
                 results["balance"] = step_balance(project)
+
+            elif step == "generate":
+                # GAN-генерация — импорт по требованию (тяжёлая зависимость torch)
+                from modules.generator import generate_images
+                results["generate"] = generate_images(project, count=args.count)
 
             elif step == "export":
                 # Формат: из --format или интерактивный запрос
