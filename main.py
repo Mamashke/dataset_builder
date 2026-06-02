@@ -772,6 +772,13 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     grp_run.add_argument(
+        "--batch-size", type=int, default=None, dest="batch_size", metavar="N",
+        help=(
+            "Размер батча для обучения GAN (с --train-gan). "
+            "По умолчанию берётся из config.GAN_BATCH_SIZE"
+        ),
+    )
+    grp_run.add_argument(
         "--count", type=int, default=200, metavar="N",
         help="Количество кадров (с --generate или --compose, по умолчанию 200)",
     )
@@ -941,14 +948,19 @@ def main() -> None:
     if args.train_gan:
         from modules.generator import train_gan
         import config as _cfg
-        _img_size = args.image_size if args.image_size is not None else _cfg.GAN_IMAGE_SIZE
+        _img_size   = args.image_size if args.image_size is not None else _cfg.GAN_IMAGE_SIZE
+        _batch_size = args.batch_size if args.batch_size is not None else _cfg.GAN_BATCH_SIZE
         print(BANNER)
         print(
             f"\nОбучение GAN | проект: {project.name} | "
-            f"эпох: {args.epochs} | разрешение: {_img_size}×{_img_size}"
+            f"эпох: {args.epochs} | batch_size: {_batch_size} | "
+            f"разрешение: {_img_size}×{_img_size}"
         )
         try:
-            result = train_gan(project, epochs=args.epochs, image_size=_img_size)
+            result = train_gan(
+                project, epochs=args.epochs,
+                batch_size=_batch_size, image_size=_img_size,
+            )
             print(
                 f"\nGAN обучен за {result['epochs']} эпох | "
                 f"loss_G={result['final_loss_g']} | loss_D={result['final_loss_d']}"

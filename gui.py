@@ -116,6 +116,7 @@ def _load_settings() -> dict:
         "frame_sample_rate":  config.FRAME_SAMPLE_RATE,
         "pos_neg_ratio":      config.POS_NEG_RATIO,
         "gan_image_size":     config.GAN_IMAGE_SIZE,
+        "gan_batch_size":     config.GAN_BATCH_SIZE,
         "augment_intensity":  0.5,
         "aug_types":          ["fog", "rain", "noise", "blur", "brightness"],
         "annotate_model":     "yolov8n.pt",
@@ -328,11 +329,12 @@ class GanTrainWorker(QThread):
     finished   = pyqtSignal(dict)
     error      = pyqtSignal(str)
 
-    def __init__(self, project: Project, epochs: int, image_size: int = 64):
+    def __init__(self, project: Project, epochs: int, image_size: int = 64, batch_size: int = 16):
         super().__init__()
         self.project          = project
         self.epochs           = epochs
         self.image_size       = image_size
+        self.batch_size       = batch_size
         # Флаг досрочной остановки — GUI устанавливает через stop()
         self._stop_requested: bool = False
 
@@ -351,6 +353,7 @@ class GanTrainWorker(QThread):
         try:
             result = train_gan(
                 self.project, epochs=self.epochs,
+                batch_size=self.batch_size,
                 image_size=self.image_size, on_epoch=_on_epoch,
             )
             self.finished.emit(result)
@@ -1055,6 +1058,7 @@ class PipelineTab(QWidget):
             self.current_project,
             self.spin_gan_epochs.value(),
             image_size=self.settings.get("gan_image_size", config.GAN_IMAGE_SIZE),
+            batch_size=self.settings.get("gan_batch_size", config.GAN_BATCH_SIZE),
         )
         self.gan_worker.epoch_done.connect(self._on_gan_epoch_done)
         self.gan_worker.finished.connect(self._on_gan_finished)
@@ -1394,6 +1398,18 @@ class SettingsTab(QWidget):
         size_row.addStretch()
         gan_form.addRow("Разрешение изображения:", size_widget)
 
+        # Размер батча
+        self.spin_gan_batch = QSpinBox()
+        self.spin_gan_batch.setRange(8, 128)
+        self.spin_gan_batch.setSingleStep(8)
+        self.spin_gan_batch.setValue(settings.get("gan_batch_size", config.GAN_BATCH_SIZE))
+        self.spin_gan_batch.setFixedWidth(80)
+        self.spin_gan_batch.setToolTip(
+            "Больше = быстрее, но требует больше VRAM.\n"
+            "RTX 3060 6 ГБ: максимум 16–32. RTX A6000 48 ГБ: до 128"
+        )
+        gan_form.addRow("Размер батча:", self.spin_gan_batch)
+
         root.addWidget(grp_gan)
 
         # Кнопка «Сохранить всё»
@@ -1467,6 +1483,7 @@ class SettingsTab(QWidget):
             "annotate_overwrite": self.chk_overwrite.isChecked(),
             "expansion_method":   expand_method,
             "gan_image_size":     gan_image_size,
+            "gan_batch_size":     self.spin_gan_batch.value(),
         })
         _save_settings(self.settings)
         # Сигнал уже мог уйти при переключении radio — посылаем ещё раз для надёжности
