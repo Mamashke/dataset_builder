@@ -90,6 +90,9 @@ class Project:
         self.gan_model_dir   = self.dir / "gan_model"
         self.gan_samples_dir = self.dir / "gan_samples"
 
+        # Copy-Paste: вырезанные фигуры людей для композиционной аугментации
+        self.persons_dir = self.dir / "persons"
+
         # Настраиваемые пути к источникам данных.
         # Хранятся в project.json и могут указывать на любое место файловой системы.
         # Инициализируем пустой структурой, затем заполняем из project.json (если он есть).
@@ -144,6 +147,7 @@ class Project:
             self.logs_dir,
             self.gan_model_dir,
             self.gan_samples_dir,
+            self.persons_dir,
         ]
         for d in dirs:
             d.mkdir(parents=True, exist_ok=True)

@@ -53,12 +53,14 @@ BANNER = """\
 PIPELINE_STEPS = ["load", "annotate", "augment", "balance", "export"]
 
 STEP_NAMES = {
-    "load":     "Загрузка видео",
-    "annotate": "Разметка кадров",
-    "augment":  "Аугментация",
-    "balance":  "Балансировка",
-    "export":   "Экспорт датасета",
-    "generate": "Генерация (GAN)",
+    "load":             "Загрузка видео",
+    "annotate":         "Разметка кадров",
+    "augment":          "Аугментация",
+    "balance":          "Балансировка",
+    "export":           "Экспорт датасета",
+    "generate":         "Генерация (GAN)",
+    "compose":          "Компоновка (Copy-Paste)",
+    "extract_persons":  "Извлечение фигур",
 }
 
 # Соответствие пунктов меню «С чего начать?» первому шагу пайплайна
@@ -573,6 +575,10 @@ def _print_report(project: Project, results: dict, total_seconds: float) -> None
         r = results["generate"]
         print(f"   GAN-генерация: создано {r.get('generated','—')} кадров")
 
+    if "compose" in results:
+        r = results["compose"]
+        print(f"   Copy-Paste:    создано {r.get('composed','—')} кадров")
+
     print(f"   Время работы: {_fmt_duration(total_seconds)}")
     print("================================")
 
@@ -758,8 +764,24 @@ def _parse_args() -> argparse.Namespace:
         help="Количество эпох обучения GAN (с --train-gan, по умолчанию 100)",
     )
     grp_run.add_argument(
+        "--image-size", type=int, default=None, dest="image_size",
+        choices=[64, 128, 256], metavar="{64,128,256}",
+        help=(
+            "Разрешение изображений для GAN (с --train-gan): 64, 128 или 256. "
+            "По умолчанию берётся из config.GAN_IMAGE_SIZE"
+        ),
+    )
+    grp_run.add_argument(
         "--count", type=int, default=200, metavar="N",
-        help="Количество генерируемых кадров (с --generate, по умолчанию 200)",
+        help="Количество кадров (с --generate или --compose, по умолчанию 200)",
+    )
+    grp_run.add_argument(
+        "--extract-persons", action="store_true", dest="extract_persons",
+        help="Вырезать фигуры людей из dataset/images/ в persons/",
+    )
+    grp_run.add_argument(
+        "--compose", action="store_true",
+        help="Создать синтетические кадры методом Copy-Paste (использует --count)",
     )
 
     # Группа управления источниками данных
@@ -803,7 +825,8 @@ def _parse_args() -> argparse.Namespace:
     pipeline_flags = (
         any(getattr(args, s, False)
             for s in ["all", "load", "annotate", "augment", "balance", "export",
-                      "clean", "train_gan", "generate"])
+                      "clean", "train_gan", "generate",
+                      "extract_persons", "compose"])
         or bool(args.from_step)
         or bool(args.frames or args.processed or args.all_data)
         or bool(args.set_source)
@@ -917,10 +940,15 @@ def main() -> None:
 
     if args.train_gan:
         from modules.generator import train_gan
+        import config as _cfg
+        _img_size = args.image_size if args.image_size is not None else _cfg.GAN_IMAGE_SIZE
         print(BANNER)
-        print(f"\nОбучение GAN | проект: {project.name} | эпох: {args.epochs}")
+        print(
+            f"\nОбучение GAN | проект: {project.name} | "
+            f"эпох: {args.epochs} | разрешение: {_img_size}×{_img_size}"
+        )
         try:
-            result = train_gan(project, epochs=args.epochs)
+            result = train_gan(project, epochs=args.epochs, image_size=_img_size)
             print(
                 f"\nGAN обучен за {result['epochs']} эпох | "
                 f"loss_G={result['final_loss_g']} | loss_D={result['final_loss_d']}"
@@ -937,6 +965,30 @@ def main() -> None:
         try:
             result = generate_images(project, count=args.count)
             print(f"Готово: создано {result['generated']} кадров.")
+        except (FileNotFoundError, Exception) as exc:
+            print(f"Ошибка: {exc}")
+            sys.exit(1)
+        return
+
+    if args.extract_persons:
+        from modules.compositor import extract_persons
+        print(BANNER)
+        print(f"\nИзвлечение фигур | проект: {project.name}")
+        try:
+            paths = extract_persons(project)
+            print(f"Готово: вырезано {len(paths)} фигур.")
+        except (FileNotFoundError, Exception) as exc:
+            print(f"Ошибка: {exc}")
+            sys.exit(1)
+        return
+
+    if args.compose:
+        from modules.compositor import compose
+        print(BANNER)
+        print(f"\nКомпоновка кадров | проект: {project.name} | кадров: {args.count}")
+        try:
+            result = compose(project, count=args.count)
+            print(f"Готово: создано {result['composed']} кадров.")
         except (FileNotFoundError, Exception) as exc:
             print(f"Ошибка: {exc}")
             sys.exit(1)
@@ -969,6 +1021,16 @@ def main() -> None:
             elif "load" in steps:
                 steps.insert(steps.index("load") + 1, "generate")
             logger.info("Добавлен шаг 'generate' — найдена модель GAN")
+
+            # Если есть вырезанные фигуры — добавляем compose сразу после generate,
+            # чтобы Copy-Paste кадры тоже попали в аннотирование и балансировку
+            persons_dir = project.persons_dir
+            if (persons_dir.exists() and
+                    any(p.suffix.lower() in {".jpg", ".jpeg", ".png"}
+                        for p in persons_dir.iterdir())):
+                if "generate" in steps:
+                    steps.insert(steps.index("generate") + 1, "compose")
+                logger.info("Добавлен шаг 'compose' — найдены фигуры в persons/")
     else:
         # Только шаги, явно указанные флагами
         steps = [s for s in PIPELINE_STEPS if getattr(args, s, False)]
@@ -1010,6 +1072,10 @@ def main() -> None:
                 # GAN-генерация — импорт по требованию (тяжёлая зависимость torch)
                 from modules.generator import generate_images
                 results["generate"] = generate_images(project, count=args.count)
+
+            elif step == "compose":
+                from modules.compositor import compose as do_compose
+                results["compose"] = do_compose(project, count=args.count)
 
             elif step == "export":
                 # Формат: из --format или интерактивный запрос

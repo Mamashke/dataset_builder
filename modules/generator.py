@@ -1,12 +1,12 @@
 # modules/generator.py — DCGAN для генерации синтетических кадров БПЛА.
 #
-# Архитектура: DCGAN (Deep Convolutional GAN), разрешение 64×64.
+# Архитектура: DCGAN (Deep Convolutional GAN), разрешение 64×64 / 128×128 / 256×256.
 #
 # Публичный интерфейс:
-#   Generator      — архитектура генератора (nn.Module)
-#   Discriminator  — архитектура дискриминатора (nn.Module)
-#   train_gan(project, epochs, batch_size)  — обучение DCGAN
-#   generate_images(project, count)         — генерация кадров
+#   Generator(latent_dim, image_size)           — архитектура генератора (nn.Module)
+#   Discriminator(image_size)                   — архитектура дискриминатора (nn.Module)
+#   train_gan(project, epochs, batch_size, image_size)  — обучение DCGAN
+#   generate_images(project, count)                     — генерация кадров
 #
 # Зависимости: torch, torchvision, cv2, numpy, Pillow
 
@@ -23,6 +23,7 @@ import torchvision.utils as vutils
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
+import config
 from modules.logger import get_logger
 from modules.project import Project
 
@@ -82,18 +83,24 @@ def _weights_init(m: nn.Module) -> None:
 # ---------------------------------------------------------------------------
 
 class Generator(nn.Module):
-    """DCGAN-генератор: вектор шума (100,) → изображение 64×64×3.
+    """DCGAN-генератор с динамической архитектурой.
 
-    Вход:  тензор (batch, 100, 1, 1) — случайный шум z ~ N(0, 1).
-    Выход: тензор (batch, 3, 64, 64) в диапазоне [-1, 1].
+    Вход:  тензор (batch, latent_dim, 1, 1) — случайный шум z ~ N(0, 1).
+    Выход: тензор (batch, 3, image_size, image_size) в диапазоне [-1, 1].
 
-    Каналы:  100 → 512 → 256 → 128 → 64 → 3
-    Размеры: (1,1) → (4,4) → (8,8) → (16,16) → (32,32) → (64,64)
+    image_size=64:  100 → 512 → 256 → 128 → 64 → 3
+    image_size=128: 100 → 512 → 256 → 128 → 64 → 32 → 3
+    image_size=256: 100 → 512 → 256 → 128 → 64 → 32 → 16 → 3
+
+    Каждый шаг удвоения разрешения сверх базового 64px — один дополнительный блок.
     """
 
-    def __init__(self, latent_dim: int = LATENT_DIM):
+    def __init__(self, latent_dim: int = LATENT_DIM, image_size: int = 64):
         super().__init__()
-        self.main = nn.Sequential(
+        # Количество дополнительных блоков апсэмплинга сверх базовых четырёх
+        _extra = {64: 0, 128: 1, 256: 2}.get(image_size, 0)
+
+        layers = [
             # Блок 1: (latent_dim, 1, 1) → (512, 4, 4)
             nn.ConvTranspose2d(latent_dim, 512, kernel_size=4, stride=1, padding=0, bias=False),
             nn.BatchNorm2d(512),
@@ -110,10 +117,25 @@ class Generator(nn.Module):
             nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(True),
-            # Финальный слой: (64, 32, 32) → (3, 64, 64)
-            nn.ConvTranspose2d(64, 3, kernel_size=4, stride=2, padding=1, bias=False),
+        ]
+
+        # Дополнительные блоки для image_size > 64: каждый удваивает разрешение
+        ch = 64
+        for _ in range(_extra):
+            layers += [
+                nn.ConvTranspose2d(ch, ch // 2, kernel_size=4, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(ch // 2),
+                nn.ReLU(True),
+            ]
+            ch //= 2
+
+        # Финальный слой → (3, image_size, image_size)
+        layers += [
+            nn.ConvTranspose2d(ch, 3, kernel_size=4, stride=2, padding=1, bias=False),
             nn.Tanh(),
-        )
+        ]
+
+        self.main = nn.Sequential(*layers)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         return self.main(z)
@@ -124,39 +146,58 @@ class Generator(nn.Module):
 # ---------------------------------------------------------------------------
 
 class Discriminator(nn.Module):
-    """DCGAN-дискриминатор: изображение 64×64×3 → вероятность (0–1).
+    """DCGAN-дискриминатор с динамической архитектурой.
 
-    Вход:  тензор (batch, 3, 64, 64).
+    Вход:  тензор (batch, 3, image_size, image_size).
     Выход: тензор (batch,) — вероятность того, что изображение реальное.
 
-    Каналы:  3 → 64 → 128 → 256 → 512 → 1
-    Размеры: (64,64) → (32,32) → (16,16) → (8,8) → (4,4) → (1,1)
+    image_size=64:  3 → 64 → 128 → 256 → 512 → 1
+    image_size=128: 3 → 32 → 64 → 128 → 256 → 512 → 1
+    image_size=256: 3 → 16 → 32 → 64 → 128 → 256 → 512 → 1
 
-    Первый блок без BatchNorm — стандарт DCGAN для дискриминатора.
+    Первый блок всегда без BatchNorm — стандарт DCGAN для дискриминатора.
     """
 
-    def __init__(self):
+    def __init__(self, image_size: int = 64):
         super().__init__()
-        self.main = nn.Sequential(
-            # Блок 1: (3, 64, 64) → (64, 32, 32); без BN на первом слое
-            nn.Conv2d(3, 64, kernel_size=4, stride=2, padding=1, bias=False),
+        # Дополнительные блоки в начале: 64→0, 128→1, 256→2
+        _extra = {64: 0, 128: 1, 256: 2}.get(image_size, 0)
+
+        # Каналы первого блока: 64 для 64px, 32 для 128px, 16 для 256px
+        first_ch = 64 >> _extra
+
+        # Первый блок — без BatchNorm (стандарт DCGAN для дискриминатора)
+        layers = [
+            nn.Conv2d(3, first_ch, kernel_size=4, stride=2, padding=1, bias=False),
             nn.LeakyReLU(0.2, inplace=True),
-            # Блок 2: (64, 32, 32) → (128, 16, 16)
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, inplace=True),
-            # Блок 3: (128, 16, 16) → (256, 8, 8)
-            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.2, inplace=True),
-            # Блок 4: (256, 8, 8) → (512, 4, 4)
-            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.2, inplace=True),
-            # Финальный слой: (512, 4, 4) → (1, 1, 1)
+        ]
+
+        # Дополнительные блоки для image_size > 64: удваиваем каналы
+        ch = first_ch
+        for _ in range(_extra):
+            layers += [
+                nn.Conv2d(ch, ch * 2, kernel_size=4, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(ch * 2),
+                nn.LeakyReLU(0.2, inplace=True),
+            ]
+            ch *= 2
+
+        # Основные блоки (одинаковы для всех image_size): → 128 → 256 → 512
+        for out_ch in [128, 256, 512]:
+            layers += [
+                nn.Conv2d(ch, out_ch, kernel_size=4, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.LeakyReLU(0.2, inplace=True),
+            ]
+            ch = out_ch
+
+        # Финальный слой: (512, 4, 4) → (1, 1, 1)
+        layers += [
             nn.Conv2d(512, 1, kernel_size=4, stride=1, padding=0, bias=False),
             nn.Sigmoid(),
-        )
+        ]
+
+        self.main = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.main(x).view(-1)
@@ -170,13 +211,15 @@ def train_gan(
     project: Project,
     epochs: int = 100,
     batch_size: int = 16,
+    image_size: int = None,
     on_epoch=None,
 ) -> dict:
     """Обучает DCGAN на оригинальных кадрах проекта.
 
-    Загружает кадры из project.frames_real_dir, исключая аугментированные
-    и уже сгенерированные (с именами gan_*). Обучает генератор и дискриминатор
-    с оптимизатором Adam (lr=0.0002, betas=(0.5, 0.999)).
+    Ищет кадры сначала через data_sources["frames"]["real"]; если не задан —
+    берёт project.frames_real_dir. Исключает аугментированные кадры и уже
+    сгенерированные (gan_*). Обучает генератор и дискриминатор с оптимизатором
+    Adam (lr=0.0002, betas=(0.5, 0.999)).
 
     Каждые 10 эпох сохраняет сетку 4×4 из 16 сэмплов в project.gan_samples_dir.
     После обучения сохраняет generator.pth и discriminator.pth в project.gan_model_dir.
@@ -185,18 +228,39 @@ def train_gan(
         project:    объект Project — определяет пути к кадрам и результатам.
         epochs:     количество эпох (по умолчанию 100).
         batch_size: размер батча (по умолчанию 16).
+        image_size: разрешение обучения: 64, 128 или 256. None → config.GAN_IMAGE_SIZE.
+        on_epoch:   колбэк (epoch, total, loss_g, loss_d) → bool; True = досрочный стоп.
 
     Returns:
         {"epochs": N, "final_loss_g": float, "final_loss_d": float}
 
     Raises:
-        FileNotFoundError: если в frames_real_dir нет оригинальных кадров.
+        FileNotFoundError: если папка с кадрами не найдена или пуста.
+        ValueError:        если image_size не входит в {64, 128, 256}.
     """
     get_logger(__name__, project.logs_dir)
 
-    frames_dir = project.frames_real_dir
-    if not frames_dir.exists():
-        raise FileNotFoundError(f"Папка с кадрами не найдена: {frames_dir}")
+    # Берём image_size из config если не передан явно
+    if image_size is None:
+        image_size = config.GAN_IMAGE_SIZE
+
+    if image_size not in (64, 128, 256):
+        raise ValueError(f"image_size должен быть 64, 128 или 256, получено: {image_size}")
+
+    # Сначала проверяем data_sources — путь может быть задан вне папки проекта
+    frames_dir = project.get_source("frames", "real")
+
+    # Если не задан — берём папку проекта
+    if frames_dir is None:
+        frames_dir = project.frames_real_dir
+
+    # Папка не существует или пустая — ошибка с подсказкой по исправлению
+    if not frames_dir.exists() or not any(frames_dir.iterdir()):
+        raise FileNotFoundError(
+            f"Кадры не найдены. Укажите путь: "
+            f"python main.py --project '{project.name}' "
+            f"--set-source frames real C:/path/"
+        )
 
     # Фильтруем только оригинальные кадры — без суффиксов аугментации и gan_
     all_images = [
@@ -224,13 +288,17 @@ def train_gan(
 
     logger.info(
         f"train_gan | проект={project.name} | кадров={len(all_images)} | "
-        f"epochs={epochs} | batch_size={batch_size} | device={device}"
+        f"epochs={epochs} | batch_size={batch_size} | "
+        f"image_size={image_size} | device={device}"
     )
-    print(f"Устройство: {device}  |  кадров для обучения: {len(all_images)}")
+    print(
+        f"Устройство: {device}  |  кадров: {len(all_images)}  |  "
+        f"разрешение: {image_size}×{image_size}"
+    )
 
-    # Трансформация: ресайз до 64×64 → тензор → нормализация в [-1, 1]
+    # Трансформация: ресайз до image_size×image_size → тензор → нормализация в [-1, 1]
     transform = T.Compose([
-        T.Resize((64, 64)),
+        T.Resize((image_size, image_size)),
         T.ToTensor(),
         T.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
     ])
@@ -243,9 +311,9 @@ def train_gan(
         num_workers=0, drop_last=True,
     )
 
-    # Инициализация моделей и весов
-    G = Generator(LATENT_DIM).to(device)
-    D = Discriminator().to(device)
+    # Инициализация моделей с нужным разрешением
+    G = Generator(LATENT_DIM, image_size).to(device)
+    D = Discriminator(image_size).to(device)
     G.apply(_weights_init)
     D.apply(_weights_init)
 
@@ -348,10 +416,11 @@ def train_gan(
     print(f"Обучение завершено. Веса → {project.gan_model_dir}")
 
     project.update_stats({
-        "gan_epochs":  last_epoch,
-        "gan_frames":  len(all_images),
-        "gan_loss_g":  round(loss_g_last, 4),
-        "gan_loss_d":  round(loss_d_last, 4),
+        "gan_epochs":     last_epoch,
+        "gan_frames":     len(all_images),
+        "gan_loss_g":     round(loss_g_last, 4),
+        "gan_loss_d":     round(loss_d_last, 4),
+        "gan_image_size": image_size,
     })
 
     return {
@@ -375,6 +444,10 @@ def generate_images(
     изображений батчами по 16, денормализует, масштабирует до 640×640
     (INTER_LANCZOS4) и сохраняет в project.frames_real_dir как gan_NNNNNN.jpg.
 
+    Исходные (реальные) кадры могут храниться во внешнем пути через
+    data_sources["frames"]["real"], но сгенерированные кадры всегда
+    записываются в project.frames_real_dir — внутрь папки проекта.
+
     Args:
         project: объект Project — определяет пути к модели и кадрам.
         count:   количество изображений для генерации (по умолчанию 200).
@@ -395,16 +468,22 @@ def generate_images(
             f"python main.py --project '{project.name}' --train-gan"
         )
 
+    # Читаем разрешение из статистики проекта — оно было сохранено при обучении
+    meta       = project._read_meta()
+    image_size = meta.get("stats", {}).get("gan_image_size", config.GAN_IMAGE_SIZE)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(
         f"generate_images | проект={project.name} | "
-        f"count={count} | device={device}"
+        f"count={count} | image_size={image_size} | device={device}"
     )
 
-    G = Generator(LATENT_DIM).to(device)
+    G = Generator(LATENT_DIM, image_size).to(device)
     G.load_state_dict(torch.load(model_path, map_location=device))
     G.eval()
 
+    # Генерированные кадры всегда сохраняются внутри проекта,
+    # независимо от того, где хранятся исходные (data_sources["frames"]["real"])
     output_dir = project.frames_real_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 

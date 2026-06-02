@@ -115,6 +115,7 @@ def _load_settings() -> dict:
     defaults = {
         "frame_sample_rate":  config.FRAME_SAMPLE_RATE,
         "pos_neg_ratio":      config.POS_NEG_RATIO,
+        "gan_image_size":     config.GAN_IMAGE_SIZE,
         "augment_intensity":  0.5,
         "aug_types":          ["fog", "rain", "noise", "blur", "brightness"],
         "annotate_model":     "yolov8n.pt",
@@ -327,10 +328,11 @@ class GanTrainWorker(QThread):
     finished   = pyqtSignal(dict)
     error      = pyqtSignal(str)
 
-    def __init__(self, project: Project, epochs: int):
+    def __init__(self, project: Project, epochs: int, image_size: int = 64):
         super().__init__()
         self.project          = project
         self.epochs           = epochs
+        self.image_size       = image_size
         # Флаг досрочной остановки — GUI устанавливает через stop()
         self._stop_requested: bool = False
 
@@ -348,7 +350,8 @@ class GanTrainWorker(QThread):
 
         try:
             result = train_gan(
-                self.project, epochs=self.epochs, on_epoch=_on_epoch
+                self.project, epochs=self.epochs,
+                image_size=self.image_size, on_epoch=_on_epoch,
             )
             self.finished.emit(result)
         except Exception as exc:
@@ -1049,7 +1052,9 @@ class PipelineTab(QWidget):
             return
         self._set_gan_running(True)
         self.gan_worker = GanTrainWorker(
-            self.current_project, self.spin_gan_epochs.value()
+            self.current_project,
+            self.spin_gan_epochs.value(),
+            image_size=self.settings.get("gan_image_size", config.GAN_IMAGE_SIZE),
         )
         self.gan_worker.epoch_done.connect(self._on_gan_epoch_done)
         self.gan_worker.finished.connect(self._on_gan_finished)
@@ -1366,6 +1371,31 @@ class SettingsTab(QWidget):
 
         root.addWidget(grp_aug)
 
+        # ── Параметры GAN ────────────────────────────────────
+        grp_gan      = QGroupBox("Параметры GAN")
+        gan_form     = QFormLayout(grp_gan)
+
+        # Радио-кнопки выбора разрешения изображения
+        size_widget = QWidget()
+        size_row    = QHBoxLayout(size_widget)
+        size_row.setContentsMargins(0, 0, 0, 0)
+        self.r_gan_size_64  = QRadioButton("64×64")
+        self.r_gan_size_128 = QRadioButton("128×128")
+        self.r_gan_size_256 = QRadioButton("256×256")
+        _saved_size = settings.get("gan_image_size", config.GAN_IMAGE_SIZE)
+        if _saved_size == 128:
+            self.r_gan_size_128.setChecked(True)
+        elif _saved_size == 256:
+            self.r_gan_size_256.setChecked(True)
+        else:
+            self.r_gan_size_64.setChecked(True)
+        for r in (self.r_gan_size_64, self.r_gan_size_128, self.r_gan_size_256):
+            size_row.addWidget(r)
+        size_row.addStretch()
+        gan_form.addRow("Разрешение изображения:", size_widget)
+
+        root.addWidget(grp_gan)
+
         # Кнопка «Сохранить всё»
         btn_save = QPushButton("Сохранить настройки")
         btn_save.setMinimumHeight(36)
@@ -1418,6 +1448,13 @@ class SettingsTab(QWidget):
 
         expand_method = "gan" if self.r_expand_gan.isChecked() else "augment"
 
+        if self.r_gan_size_256.isChecked():
+            gan_image_size = 256
+        elif self.r_gan_size_128.isChecked():
+            gan_image_size = 128
+        else:
+            gan_image_size = 64
+
         self.settings.update({
             "frame_sample_rate":  self.spin_sample.value(),
             "pos_neg_ratio":      self.spin_ratio.value(),
@@ -1429,6 +1466,7 @@ class SettingsTab(QWidget):
             "annotate_sources":   ann_sources,
             "annotate_overwrite": self.chk_overwrite.isChecked(),
             "expansion_method":   expand_method,
+            "gan_image_size":     gan_image_size,
         })
         _save_settings(self.settings)
         # Сигнал уже мог уйти при переключении radio — посылаем ещё раз для надёжности
