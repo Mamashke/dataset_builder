@@ -1,1 +1,23 @@
-opencv-python>=4.13.0
+# =============================================================================
+# dataset_builder — зависимости проекта
+#
+# Установка:
+#   pip install -r requirements.txt
+#
+# PyTorch устанавливается отдельно (нужна версия с поддержкой CUDA):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#
+# Для CPU-only (без CUDA):
+#   pip install torch torchvision
+# =============================================================================
+
+# Основные зависимости
+opencv-python>=4.10.0
+numpy>=2.0.0
+Pillow>=10.0.0
+
+# Разметка и детекция
+ultralytics>=8.0.0
+
+# GUI
+PyQt6>=6.7.0
