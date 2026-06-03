@@ -642,6 +642,8 @@ class ProjectsTab(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Ссылка на PipelineTab устанавливается из MainWindow после создания обоих виджетов
+        self._pipeline_tab = None
         root = QVBoxLayout(self)
 
         # Таблица
@@ -765,6 +767,16 @@ class ProjectsTab(QWidget):
         )
         if ans != QMessageBox.StandardButton.Yes:
             return
+        # Проверяем активные воркеры — удаление во время работы сломает файловую структуру
+        if self._pipeline_tab is not None:
+            if self._pipeline_tab.worker and self._pipeline_tab.worker.isRunning():
+                QMessageBox.warning(self, "Ошибка",
+                    "Остановите пайплайн перед удалением проекта.")
+                return
+            if self._pipeline_tab.gan_worker and self._pipeline_tab.gan_worker.isRunning():
+                QMessageBox.warning(self, "Ошибка",
+                    "Остановите обучение GAN перед удалением проекта.")
+                return
         # Закрываем файловые обработчики логгера — иначе Windows блокирует папку
         _close_project_log_handlers()
         try:
@@ -1555,6 +1567,8 @@ class MainWindow(QMainWindow):
         self.tab_pipeline = PipelineTab(self.settings)
         self.tab_settings = SettingsTab(self.settings)
         self.tab_logs     = LogsTab()
+        # Связываем вкладки: ProjectsTab проверяет воркеры PipelineTab перед удалением
+        self.tab_projects._pipeline_tab = self.tab_pipeline
 
         tabs.addTab(self.tab_projects, "  Проекты  ")
         tabs.addTab(self.tab_pipeline, "  Пайплайн  ")

@@ -162,7 +162,7 @@ def _parse_coco_annotations(img_id: int, img_w: int, img_h: int,
         annotations.append({
             "id":          ann_id,
             "image_id":    img_id,
-            "category_id": class_id,
+            "category_id": class_id + 1,
             "bbox":        [round(x_min, 2), round(y_min, 2),
                             round(w_px, 2),  round(h_px, 2)],
             "area":        round(w_px * h_px, 2),
@@ -218,10 +218,10 @@ def export_coco(images_dir: Path, labels_dir: Path, out_dir: Path) -> dict:
         (out_dir / "images" / split).mkdir(parents=True, exist_ok=True)
     (out_dir / "annotations").mkdir(parents=True, exist_ok=True)
 
-    # Категории одинаковы в обоих JSON
+    # Категории одинаковы в обоих JSON; id начинается с 1 — стандарт COCO (0 зарезервирован под фон)
     categories = [
-        {"id": i, "name": name}
-        for i, name in enumerate(config.CLASS_NAMES)
+        {"id": i, "name": name, "supercategory": "object"}
+        for i, name in enumerate(config.CLASS_NAMES, start=1)
     ]
 
     split_stats = {}   # {"train": {"images": N, "annotations": N}, "val": {...}}

@@ -386,7 +386,9 @@ def train_gan(
                     G(fixed_noise), nrow=4, normalize=True, value_range=(-1, 1))
                 img_np  = (grid.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                 img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-                cv2.imwrite(str(sample_path), img_bgr)
+                ok, buf = cv2.imencode(".jpg", img_bgr)
+                if ok:
+                    sample_path.write_bytes(buf.tobytes())
             G.train()
 
             logger.info(
@@ -479,7 +481,7 @@ def generate_images(
     )
 
     G = Generator(LATENT_DIM, image_size).to(device)
-    G.load_state_dict(torch.load(model_path, map_location=device))
+    G.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     G.eval()
 
     # Генерированные кадры всегда сохраняются внутри проекта,
@@ -523,7 +525,9 @@ def generate_images(
                 )
 
                 out_path = output_dir / f"gan_{next_num:06d}.jpg"
-                cv2.imwrite(str(out_path), img_bgr)
+                ok, buf = cv2.imencode(".jpg", img_bgr)
+                if ok:
+                    out_path.write_bytes(buf.tobytes())
                 next_num  += 1
                 generated += 1
 

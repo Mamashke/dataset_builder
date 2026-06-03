@@ -76,7 +76,9 @@ def _extract_frames(
         if frame_idx % sample_rate == 0:
             resized = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
             filename = f"{source}_{video_stem}_frame_{frame_idx:06d}.{fmt}"
-            cv2.imwrite(str(output_dir / filename), resized)
+            ok, buf = cv2.imencode(f".{fmt}", resized)
+            if ok:
+                (output_dir / filename).write_bytes(buf.tobytes())
             saved += 1
 
         frame_idx += 1
@@ -214,12 +216,11 @@ def load_videos(
     output_dir = project.frames_real_dir if source == "real" else project.frames_airsim_dir
 
     if input_dir is None:
-        print(
+        raise FileNotFoundError(
             f"Путь к видео не указан для источника '{source}'.\n"
             f"Укажите путь: python main.py --project '{project.name}'"
             f" --set-source videos {source} C:/path/"
         )
-        raise SystemExit(1)
 
     if not input_dir.exists():
         raise FileNotFoundError(f"Папка с видео не найдена: {input_dir}")

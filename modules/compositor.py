@@ -11,9 +11,10 @@
 # Формат выходных аннотаций (YOLO): class x_c y_c w h (нормализованные 0–1).
 # Класс людей: 0.
 
+import json
 import random
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import cv2
 import numpy as np
@@ -26,10 +27,6 @@ logger = get_logger(__name__)
 # Допустимые расширения изображений
 _IMG_EXTS = {".jpg", ".jpeg", ".png"}
 
-# Диапазон высоты человека при масштабировании (вид с БПЛА)
-_PERSON_HEIGHT_MIN = 10
-_PERSON_HEIGHT_MAX = 30
-
 # Диапазон угла поворота
 _ROTATE_MIN = -15.0
 _ROTATE_MAX =  15.0
@@ -37,6 +34,12 @@ _ROTATE_MAX =  15.0
 # Диапазон коэффициента яркости
 _BRIGHTNESS_MIN = 0.8
 _BRIGHTNESS_MAX = 1.2
+
+# Допустимое отклонение масштаба от среднего (±20 %)
+_SCALE_VARIATION = 0.20
+
+# Размер ядра гауссова размытия краёв маски вставки (нечётное число)
+_EDGE_BLUR_KERNEL = 15
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +70,53 @@ def _rotate_crop(img: np.ndarray, angle: float) -> np.ndarray:
     return cv2.warpAffine(img, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
 
 
+def _blend_person(bg: np.ndarray, person: np.ndarray, x: int, y: int) -> None:
+    """Вставляет фигуру человека на фон с размытыми краями (alpha-blending).
+
+    Создаёт бинарную маску (1 — человек, 0 — фон), размывает её края
+    гауссовым фильтром (_EDGE_BLUR_KERNEL × _EDGE_BLUR_KERNEL), чтобы
+    получить плавный переход. Изменяет bg на месте.
+
+    Формула: result = фон * (1 − маска) + человек * маска
+    """
+    p_h, p_w = person.shape[:2]
+
+    # Создаём белую маску размером с вставляемый патч
+    mask = np.ones((p_h, p_w), dtype=np.float32)
+    # Адаптивный kernel: не больше патча и не больше _EDGE_BLUR_KERNEL, всегда нечётный >= 3
+    k = min(p_h - 1, p_w - 1, _EDGE_BLUR_KERNEL)
+    k = k if k % 2 == 1 else k - 1
+    k = max(k, 3)
+    mask = cv2.GaussianBlur(mask, (k, k), 0)
+    # Нормализуем обратно к 1.0 в центре (после GaussianBlur максимум < 1)
+    mask /= mask.max()
+    # Расширяем для поканального умножения: (H, W) → (H, W, 1)
+    mask3 = mask[:, :, np.newaxis]
+
+    bg_roi   = bg[y : y + p_h, x : x + p_w].astype(np.float32)
+    person_f = person.astype(np.float32)
+
+    blended = bg_roi * (1.0 - mask3) + person_f * mask3
+    bg[y : y + p_h, x : x + p_w] = np.clip(blended, 0, 255).astype(np.uint8)
+
+
+def _load_metadata(persons_dir: Path) -> list:
+    """Загружает метаданные вырезанных людей из persons/metadata.json."""
+    meta_path = persons_dir / "metadata.json"
+    if not meta_path.exists():
+        return []
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _avg_person_height(metadata: list) -> Optional[float]:
+    """Возвращает среднюю высоту людей из метаданных, или None если нет данных."""
+    heights = [m["original_height_px"] for m in metadata if "original_height_px" in m]
+    return sum(heights) / len(heights) if heights else None
+
+
 # ---------------------------------------------------------------------------
 # Публичная функция: извлечение фигур людей
 # ---------------------------------------------------------------------------
@@ -78,6 +128,9 @@ def extract_persons(project: Project) -> List[Path]:
     файл разметки из dataset/labels/. Кадры без аннотаций (негативные)
     и пустые файлы пропускаются. Для каждой bbox вырезает регион и
     сохраняет в project.persons_dir.
+
+    Дополнительно записывает persons/metadata.json с оригинальной высотой
+    каждой вырезанной фигуры — используется в compose() для нормализации масштаба.
 
     Args:
         project: объект Project с путями к датасету и папке persons.
@@ -111,8 +164,10 @@ def extract_persons(project: Project) -> List[Path]:
     )
 
     saved_paths: List[Path] = []
-    extracted   = 0
-    skipped     = 0
+    # Список записей для persons/metadata.json
+    metadata: list = []
+    extracted = 0
+    skipped   = 0
 
     for img_path in image_files:
         label_path = labels_dir / (img_path.stem + ".txt")
@@ -161,10 +216,24 @@ def extract_persons(project: Project) -> List[Path]:
             if crop.size == 0:
                 continue
 
-            out_path = persons_dir / f"{img_path.stem}_obj{obj_idx}.jpg"
+            out_name = f"{img_path.stem}_obj{obj_idx}.jpg"
+            out_path = persons_dir / out_name
             if _write_image(out_path, crop):
                 saved_paths.append(out_path)
+                # Запоминаем оригинальную высоту bbox для нормализации масштаба в compose()
+                metadata.append({
+                    "filename": out_name,
+                    "original_height_px": y2 - y1,
+                })
                 extracted += 1
+
+    # Сохраняем метаданные рядом с вырезанными фигурами
+    meta_path = persons_dir / "metadata.json"
+    meta_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    logger.info(f"Метаданные записаны → {meta_path} ({len(metadata)} записей)")
 
     logger.info(
         f"extract_persons завершён: вырезано={extracted}, "
@@ -186,11 +255,12 @@ def compose(project: Project, count: int = 200) -> dict:
       1. Берёт случайный негативный кадр из dataset/images/ как фон.
       2. Вставляет 1–3 случайных человека из persons_dir.
       3. Для каждого человека:
-         - масштабирует до высоты 10–30 пикселей (вид с БПЛА),
+         - масштабирует до среднего размера из metadata.json ±20%
+           (или 10–30 px, если metadata.json отсутствует),
          - применяет случайный поворот -15..+15°,
          - лёгкое гауссово размытие (ядро 3–7),
          - небольшое изменение яркости ±20%,
-         - вставляет в случайную позицию на фоне.
+         - вставляет с размытыми краями (alpha-blending через маску).
       4. Записывает YOLO-аннотацию с координатами вставки.
 
     Сохраняет:
@@ -212,7 +282,7 @@ def compose(project: Project, count: int = 200) -> dict:
     persons_dir = project.persons_dir
     output_dir  = project.frames_real_dir
     # Аннотации comp_ кадров кладём туда же, куда annotator сохраняет real-разметку
-    ann_dir     = project.annotations_dir / "real"
+    ann_dir = project.annotations_dir / "real"
 
     # Собираем негативные кадры (фоны) — пустые или отсутствующие аннотации
     backgrounds: List[Path] = []
@@ -245,6 +315,21 @@ def compose(project: Project, count: int = 200) -> dict:
         raise FileNotFoundError(
             f"Фигуры людей не найдены в {persons_dir}.\n"
             f"Сначала запустите: --extract-persons"
+        )
+
+    # Загружаем метаданные для нормализации масштаба
+    metadata   = _load_metadata(persons_dir)
+    avg_height = _avg_person_height(metadata)
+    if avg_height is not None:
+        logger.info(f"Средняя высота людей из metadata.json: {avg_height:.1f} px")
+        print(
+            f"Средняя высота людей: {avg_height:.1f} px "
+            f"(±{int(_SCALE_VARIATION * 100)}%)"
+        )
+    else:
+        # Если metadata.json отсутствует — используем фиксированный диапазон
+        logger.warning(
+            "metadata.json не найден, масштаб будет случайным в диапазоне 10–30 px"
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -297,8 +382,15 @@ def compose(project: Project, count: int = 200) -> dict:
             if p_h_orig == 0 or p_w_orig == 0:
                 continue
 
-            # Масштабируем до целевой высоты 10–30 пикселей
-            target_h = random.randint(_PERSON_HEIGHT_MIN, _PERSON_HEIGHT_MAX)
+            # Целевая высота: avg из metadata ±20%, иначе случайно 10–30 px
+            if avg_height is not None:
+                variation = random.uniform(
+                    1.0 - _SCALE_VARIATION,
+                    1.0 + _SCALE_VARIATION,
+                )
+                target_h = max(1, int(avg_height * variation))
+            else:
+                target_h = random.randint(10, 30)
             scale    = target_h / p_h_orig
             target_w = max(1, int(p_w_orig * scale))
             person   = cv2.resize(
@@ -331,8 +423,8 @@ def compose(project: Project, count: int = 200) -> dict:
             x = random.randint(0, bg_w - p_w)
             y = random.randint(0, bg_h - p_h)
 
-            # Вставляем фигуру на фон (прямоугольное наложение)
-            bg[y : y + p_h, x : x + p_w] = person
+            # Вставляем с размытыми краями для плавного перехода
+            _blend_person(bg, person, x, y)
 
             # Формируем YOLO-аннотацию (нормализованные координаты центра и размеров)
             x_c = (x + p_w / 2) / bg_w

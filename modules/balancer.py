@@ -295,9 +295,8 @@ def balance_dataset(frames: List[Path]) -> List[Path]:
     max_negatives = len(positives) * config.POS_NEG_RATIO
 
     if len(negatives) > max_negatives:
-        # Фиксируем seed для воспроизводимости — одинаковый датасет при повторном запуске
-        random.seed(42)
-        negatives = random.sample(negatives, max_negatives)
+        # Изолированный RNG — не мутирует глобальный random, но даёт воспроизводимый результат
+        negatives = random.Random(42).sample(negatives, max_negatives)
         logger.info(
             f"Негативных обрезано до {max_negatives} "
             f"({len(positives)} pos × {config.POS_NEG_RATIO})"
