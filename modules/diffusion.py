@@ -24,13 +24,20 @@ from modules.project import Project
 
 logger = get_logger(__name__)
 
-# Промпты открытых пространств — луга, поля, просеки (без плотного леса)
+# Промпты открытых пространств — луга, поля, просеки (без плотного леса).
+# Ключевые слова nadir / straight down / orthographic / no horizon / top down view
+# усиливают вертикальную ориентацию съёмки строго сверху вниз.
 _PROMPTS_OPEN = [
-    "aerial drone view open field meadow top down, summer green grass, no trees",
-    "aerial drone view snowy open field top down, winter flat landscape",
-    "aerial drone view forest clearing top down, grass open area, no dense trees",
-    "aerial drone view grassland top down, open flat landscape, autumn",
-    "aerial drone view dirt path open terrain top down, sparse vegetation",
+    "nadir aerial drone view open field meadow, straight down, "
+    "orthographic top down view, summer green grass, no trees, no horizon",
+    "nadir aerial drone view snowy open field, straight down, "
+    "orthographic top down view, winter flat landscape, no horizon",
+    "nadir aerial drone view forest clearing, straight down, "
+    "orthographic top down view, grass open area, no dense trees, no horizon",
+    "nadir aerial drone view grassland, straight down, "
+    "orthographic top down view, open flat landscape, autumn, no horizon",
+    "nadir aerial drone view dirt path open terrain, straight down, "
+    "orthographic top down view, sparse vegetation, no horizon",
 ]
 
 # Промпты лесных сцен — плотный лес разных сезонов
@@ -41,12 +48,13 @@ _PROMPTS_FOREST = [
     "aerial drone view forest canopy top down, summer",
 ]
 
-# Единый негативный промпт для обоих типов — явно исключаем городскую
-# и спортивную инфраструктуру, технику и артефакты качества
+# Единый негативный промпт для обоих типов — исключаем городскую инфраструктуру,
+# технику, артефакты качества и перспективные ракурсы (не вертикальные)
 _NEGATIVE_PROMPT = (
     "people, humans, person, cars, buildings, roads, stadium, "
     "urban, city, football field, sports, parking, artificial, "
-    "construction, low quality, blurry, distorted"
+    "construction, low quality, blurry, distorted, "
+    "horizon, perspective, diagonal, angle view, oblique"
 )
 
 # Префиксы имён файлов для каждого типа
