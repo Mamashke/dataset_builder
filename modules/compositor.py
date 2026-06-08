@@ -284,11 +284,15 @@ def compose(project: Project, count: int = 200) -> dict:
     # Аннотации comp_ кадров кладём туда же, куда annotator сохраняет real-разметку
     ann_dir = project.annotations_dir / "real"
 
-    # Собираем негативные кадры (фоны) — пустые или отсутствующие аннотации
+    # Собираем негативные кадры (фоны) — пустые или отсутствующие аннотации.
+    # sd_forest_ исключаем: в лесных сценах человек плохо различим,
+    # используем только sd_open_ и обычные негативные кадры.
     backgrounds: List[Path] = []
     if images_dir.exists():
         for img_path in images_dir.iterdir():
             if img_path.suffix.lower() not in _IMG_EXTS:
+                continue
+            if img_path.stem.startswith("sd_forest_"):
                 continue
             label_path = labels_dir / (img_path.stem + ".txt")
             if not label_path.exists():

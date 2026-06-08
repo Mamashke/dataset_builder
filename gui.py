@@ -131,6 +131,7 @@ def _load_settings() -> dict:
         "expansion_method":   "augment",   # "augment", "gan" или "sd"
         "gan_count":          200,          # кадров при generate (GAN)
         "sd_count":           200,          # кадров при generate_sd (Stable Diffusion)
+        "sd_bg_type":         "all",        # тип фонов: open / forest / all
     }
     if SETTINGS_FILE.exists():
         try:
@@ -223,6 +224,7 @@ class PipelineWorker(QThread):
         aug_types:          list  = None,
         gan_count:          int   = 200,
         sd_count:           int   = 200,
+        sd_bg_type:         str   = "all",
     ):
         super().__init__()
         self.project            = project
@@ -237,6 +239,7 @@ class PipelineWorker(QThread):
         self.aug_types          = aug_types or ["fog", "rain", "noise", "blur", "brightness"]
         self.gan_count          = gan_count
         self.sd_count           = sd_count
+        self.sd_bg_type         = sd_bg_type
         # Очередь для получения ответа от GUI после показа диалога выбора видео
         self._video_queue: queue.Queue = queue.Queue()
         # Флаг остановки: GUI ставит True, воркер проверяет между шагами
@@ -308,7 +311,9 @@ class PipelineWorker(QThread):
                 elif step == "generate_sd":
                     from modules.diffusion import generate_backgrounds
                     results["generate_sd"] = generate_backgrounds(
-                        self.project, count=self.sd_count
+                        self.project,
+                        count=self.sd_count,
+                        background_type=self.sd_bg_type,
                     )
 
                 elif step == "compose":
@@ -986,6 +991,24 @@ class PipelineTab(QWidget):
         sd_params_row.addStretch()
         sd_vbox.addLayout(sd_params_row)
 
+        # Тип фонов: открытые пространства / лес / оба
+        bg_type_row = QHBoxLayout()
+        bg_type_row.addWidget(QLabel("Тип фонов:"))
+        self.r_sd_open   = QRadioButton("Открытые")
+        self.r_sd_forest = QRadioButton("Лес")
+        self.r_sd_all    = QRadioButton("Все")
+        _saved_bg_type = settings.get("sd_bg_type", "all")
+        if _saved_bg_type == "open":
+            self.r_sd_open.setChecked(True)
+        elif _saved_bg_type == "forest":
+            self.r_sd_forest.setChecked(True)
+        else:
+            self.r_sd_all.setChecked(True)
+        for _r in (self.r_sd_open, self.r_sd_forest, self.r_sd_all):
+            bg_type_row.addWidget(_r)
+        bg_type_row.addStretch()
+        sd_vbox.addLayout(bg_type_row)
+
         self.btn_generate_sd = QPushButton("▶  Сгенерировать фоны")
         self.btn_generate_sd.setEnabled(False)
         self.btn_generate_sd.setMinimumHeight(36)
@@ -1056,8 +1079,13 @@ class PipelineTab(QWidget):
             "annotate_sources":   self.settings.get("annotate_sources", "all"),
             "aug_types":          self.settings.get(
                 "aug_types", ["fog", "rain", "noise", "blur", "brightness"]),
-            "gan_count":          self.settings.get("gan_count", 200),
-            "sd_count":           self.spin_sd_count.value(),
+            "gan_count":  self.settings.get("gan_count", 200),
+            "sd_count":   self.spin_sd_count.value(),
+            "sd_bg_type": (
+                "open"   if self.r_sd_open.isChecked()   else
+                "forest" if self.r_sd_forest.isChecked() else
+                "all"
+            ),
         }
 
     def _run_steps(self, steps: list) -> None:

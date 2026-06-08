@@ -712,6 +712,8 @@ def _parse_args() -> argparse.Namespace:
             "  python main.py --project дрон --clean --frames\n"
             "  python main.py --project дрон --clean --all-data\n"
             "  python main.py --project bpla --generate-backgrounds --count 200\n"
+            "  python main.py --project bpla --generate-backgrounds --type open --count 100\n"
+            "  python main.py --project bpla --generate-backgrounds --type forest --count 100\n"
         ),
     )
 
@@ -799,7 +801,15 @@ def _parse_args() -> argparse.Namespace:
         "--generate-backgrounds", action="store_true", dest="generate_backgrounds",
         help=(
             "Генерировать фоновые сцены через Stable Diffusion "
-            "(использует --count, по умолчанию 200)"
+            "(использует --count и --type)"
+        ),
+    )
+    grp_run.add_argument(
+        "--type", choices=["open", "forest", "all"], default="all",
+        dest="bg_type",
+        help=(
+            "Тип фонов для --generate-backgrounds: "
+            "open (открытые), forest (лес), all (оба, по умолчанию)"
         ),
     )
 
@@ -1023,12 +1033,17 @@ def main() -> None:
         print(BANNER)
         print(
             f"\nГенерация SD фонов | проект: {project.name} | "
-            f"кадров: {args.count}"
+            f"кадров: {args.count} | тип: {args.bg_type}"
         )
         try:
-            result = generate_backgrounds(project, count=args.count)
-            print(f"Готово: сгенерировано {result['generated']} фоновых сцен.")
-        except (FileNotFoundError, Exception) as exc:
+            result = generate_backgrounds(
+                project, count=args.count, background_type=args.bg_type
+            )
+            print(
+                f"Готово: сгенерировано {result['generated']} фоновых сцен "
+                f"(открытые={result['open']}, лесные={result['forest']})."
+            )
+        except (FileNotFoundError, ValueError, Exception) as exc:
             print(f"Ошибка: {exc}")
             sys.exit(1)
         return
