@@ -40,16 +40,19 @@ from main import step_load
 PIPELINE_STEPS = ["load", "annotate", "augment", "balance", "export"]
 
 # Варианты пайплайна в зависимости от метода расширения датасета
-_PIPELINE_STEPS_AUGMENT = ["load", "annotate", "augment",  "balance", "export"]
-_PIPELINE_STEPS_GAN     = ["load", "annotate", "generate", "balance", "export"]
+_PIPELINE_STEPS_AUGMENT = ["load", "annotate", "augment",     "balance", "export"]
+_PIPELINE_STEPS_GAN     = ["load", "annotate", "generate",    "balance", "export"]
+_PIPELINE_STEPS_SD      = ["load", "annotate", "generate_sd", "compose", "balance", "export"]
 
 STEP_NAMES = {
-    "load":     "Загрузка видео",
-    "annotate": "Разметка кадров",
-    "augment":  "Аугментация",
-    "generate": "Генерация (GAN)",
-    "balance":  "Балансировка",
-    "export":   "Экспорт датасета",
+    "load":        "Загрузка видео",
+    "annotate":    "Разметка кадров",
+    "augment":     "Аугментация",
+    "generate":    "Генерация (GAN)",
+    "generate_sd": "Генерация SD фонов",
+    "compose":     "Copy-Paste компоновка",
+    "balance":     "Балансировка",
+    "export":      "Экспорт датасета",
 }
 
 # Папки, очищаемые на каждом уровне
@@ -125,8 +128,9 @@ def _load_settings() -> dict:
         "annotate_sources":   "all",
         "annotate_overwrite": False,
         "export_format":      "yolo",
-        "expansion_method":   "augment",   # "augment" или "gan"
-        "gan_count":          200,          # кадров при generate
+        "expansion_method":   "augment",   # "augment", "gan" или "sd"
+        "gan_count":          200,          # кадров при generate (GAN)
+        "sd_count":           200,          # кадров при generate_sd (Stable Diffusion)
     }
     if SETTINGS_FILE.exists():
         try:
@@ -218,6 +222,7 @@ class PipelineWorker(QThread):
         annotate_sources:   str   = "all",
         aug_types:          list  = None,
         gan_count:          int   = 200,
+        sd_count:           int   = 200,
     ):
         super().__init__()
         self.project            = project
@@ -231,6 +236,7 @@ class PipelineWorker(QThread):
         self.annotate_sources   = annotate_sources
         self.aug_types          = aug_types or ["fog", "rain", "noise", "blur", "brightness"]
         self.gan_count          = gan_count
+        self.sd_count           = sd_count
         # Очередь для получения ответа от GUI после показа диалога выбора видео
         self._video_queue: queue.Queue = queue.Queue()
         # Флаг остановки: GUI ставит True, воркер проверяет между шагами
@@ -297,6 +303,18 @@ class PipelineWorker(QThread):
                     from modules.generator import generate_images
                     results["generate"] = generate_images(
                         self.project, count=self.gan_count
+                    )
+
+                elif step == "generate_sd":
+                    from modules.diffusion import generate_backgrounds
+                    results["generate_sd"] = generate_backgrounds(
+                        self.project, count=self.sd_count
+                    )
+
+                elif step == "compose":
+                    from modules.compositor import compose as do_compose
+                    results["compose"] = do_compose(
+                        self.project, count=self.sd_count
                     )
 
                 elif step == "balance":
@@ -865,19 +883,25 @@ class PipelineTab(QWidget):
         fmt_row.addStretch()
         root.addLayout(fmt_row)
 
-        # Отдельные шаги — кнопки для обоих вариантов пайплайна
+        # Отдельные шаги — кнопки для всех вариантов пайплайна
         grp_steps = QGroupBox("Отдельные шаги")
         steps_row = QHBoxLayout(grp_steps)
         self.step_btns: dict[str, QPushButton] = {}
-        _all_step_keys = ["load", "annotate", "augment", "generate", "balance", "export"]
+        _all_step_keys = [
+            "load", "annotate", "augment",
+            "generate", "generate_sd", "compose",
+            "balance", "export",
+        ]
         for step in _all_step_keys:
             btn = QPushButton(STEP_NAMES[step])
             btn.setEnabled(False)
             btn.clicked.connect(lambda _checked, s=step: self._run_steps([s]))
             self.step_btns[step] = btn
             steps_row.addWidget(btn)
-        # "generate" скрыт до переключения в GAN-режим
+        # По умолчанию скрываем GAN- и SD-специфичные кнопки
         self.step_btns["generate"].setVisible(False)
+        self.step_btns["generate_sd"].setVisible(False)
+        self.step_btns["compose"].setVisible(False)
         root.addWidget(grp_steps)
 
         # Запуск всего пайплайна
@@ -944,6 +968,32 @@ class PipelineTab(QWidget):
 
         root.addWidget(self.grp_gan)
 
+        # ── Блок генерации SD (показывается только в SD-режиме) ─────────────
+        self.grp_sd = QGroupBox("Генерация SD фонов")
+        self.grp_sd.setVisible(False)
+        sd_vbox = QVBoxLayout(self.grp_sd)
+
+        sd_params_row = QHBoxLayout()
+        sd_params_row.addWidget(QLabel("Фонов:"))
+        self.spin_sd_count = QSpinBox()
+        self.spin_sd_count.setRange(1, 2000)
+        self.spin_sd_count.setValue(settings.get("sd_count", 200))
+        self.spin_sd_count.setFixedWidth(90)
+        self.spin_sd_count.setToolTip(
+            "Количество фоновых сцен для генерации через Stable Diffusion"
+        )
+        sd_params_row.addWidget(self.spin_sd_count)
+        sd_params_row.addStretch()
+        sd_vbox.addLayout(sd_params_row)
+
+        self.btn_generate_sd = QPushButton("▶  Сгенерировать фоны")
+        self.btn_generate_sd.setEnabled(False)
+        self.btn_generate_sd.setMinimumHeight(36)
+        self.btn_generate_sd.clicked.connect(self._start_sd_generation)
+        sd_vbox.addWidget(self.btn_generate_sd)
+
+        root.addWidget(self.grp_sd)
+
         # Прогресс-бар пайплайна (indeterminate) + кнопка Стоп
         progress_row = QHBoxLayout()
         self.progress = QProgressBar()
@@ -972,6 +1022,7 @@ class PipelineTab(QWidget):
             btn.setEnabled(has)
         self.btn_run_all.setEnabled(has)
         self.btn_train_gan.setEnabled(has)
+        self.btn_generate_sd.setEnabled(has)
 
         if project:
             meta   = project._read_meta()
@@ -1006,6 +1057,7 @@ class PipelineTab(QWidget):
             "aug_types":          self.settings.get(
                 "aug_types", ["fog", "rain", "noise", "blur", "brightness"]),
             "gan_count":          self.settings.get("gan_count", 200),
+            "sd_count":           self.spin_sd_count.value(),
         }
 
     def _run_steps(self, steps: list) -> None:
@@ -1048,16 +1100,31 @@ class PipelineTab(QWidget):
                 self.combo_from.setCurrentIndex(i)
                 break
 
+    def _start_sd_generation(self) -> None:
+        """Запускает генерацию SD фонов как отдельный шаг пайплайна."""
+        if not self.current_project:
+            return
+        self._run_steps(["generate_sd"])
+
     def _on_expansion_method_changed(self, method: str) -> None:
-        """Переключает пайплайн и UI между режимами 'augment' и 'gan'."""
+        """Переключает пайплайн и UI между режимами 'augment', 'gan' и 'sd'."""
         is_gan = (method == "gan")
-        self._active_steps = list(_PIPELINE_STEPS_GAN if is_gan else _PIPELINE_STEPS_AUGMENT)
+        is_sd  = (method == "sd")
+        if is_sd:
+            self._active_steps = list(_PIPELINE_STEPS_SD)
+        elif is_gan:
+            self._active_steps = list(_PIPELINE_STEPS_GAN)
+        else:
+            self._active_steps = list(_PIPELINE_STEPS_AUGMENT)
         self._update_combo_from()
-        # Показываем кнопку нужного шага расширения
-        self.step_btns["augment"].setVisible(not is_gan)
+        # Кнопки шагов — показываем только соответствующий шаг расширения
+        self.step_btns["augment"].setVisible(not is_gan and not is_sd)
         self.step_btns["generate"].setVisible(is_gan)
-        # Блок обучения GAN — только в GAN-режиме
+        self.step_btns["generate_sd"].setVisible(is_sd)
+        self.step_btns["compose"].setVisible(is_sd)
+        # Блоки обучения GAN и генерации SD — взаимоисключающие
         self.grp_gan.setVisible(is_gan)
+        self.grp_sd.setVisible(is_sd)
 
     # ── обучение GAN ────────────────────────────────────────
 
@@ -1115,6 +1182,7 @@ class PipelineTab(QWidget):
         self.btn_train_gan.setEnabled(not running and has_proj)
         # Блокируем пайплайн — нельзя запустить оба процесса одновременно
         self.btn_run_all.setEnabled(not running and has_proj)
+        self.btn_generate_sd.setEnabled(not running and has_proj)
         for btn in self.step_btns.values():
             btn.setEnabled(not running and has_proj)
         self.gan_progress.setVisible(running)
@@ -1137,6 +1205,7 @@ class PipelineTab(QWidget):
         for btn in self.step_btns.values():
             btn.setEnabled(not running and has_proj)
         self.btn_run_all.setEnabled(not running and has_proj)
+        self.btn_generate_sd.setEnabled(not running and has_proj)
 
     def _on_step_started(self, step_num: int, total: int, name: str) -> None:
         """Обновляет строку статуса при старте каждого шага."""
@@ -1258,12 +1327,17 @@ class SettingsTab(QWidget):
         method_vbox = QVBoxLayout(grp_method)
         self.r_expand_augment = QRadioButton("Аугментация")
         self.r_expand_gan     = QRadioButton("GAN генерация")
-        if settings.get("expansion_method", "augment") == "gan":
+        self.r_expand_sd      = QRadioButton("Stable Diffusion")
+        _saved_method = settings.get("expansion_method", "augment")
+        if _saved_method == "gan":
             self.r_expand_gan.setChecked(True)
+        elif _saved_method == "sd":
+            self.r_expand_sd.setChecked(True)
         else:
             self.r_expand_augment.setChecked(True)
         method_vbox.addWidget(self.r_expand_augment)
         method_vbox.addWidget(self.r_expand_gan)
+        method_vbox.addWidget(self.r_expand_sd)
 
         # Уведомляем PipelineTab немедленно при переключении (без сохранения)
         self.r_expand_augment.toggled.connect(
@@ -1271,6 +1345,9 @@ class SettingsTab(QWidget):
         )
         self.r_expand_gan.toggled.connect(
             lambda checked: self.expansion_method_changed.emit("gan") if checked else None
+        )
+        self.r_expand_sd.toggled.connect(
+            lambda checked: self.expansion_method_changed.emit("sd") if checked else None
         )
         root.addWidget(grp_method)
 
@@ -1474,7 +1551,12 @@ class SettingsTab(QWidget):
         else:
             ann_sources = "all"
 
-        expand_method = "gan" if self.r_expand_gan.isChecked() else "augment"
+        if self.r_expand_sd.isChecked():
+            expand_method = "sd"
+        elif self.r_expand_gan.isChecked():
+            expand_method = "gan"
+        else:
+            expand_method = "augment"
 
         if self.r_gan_size_256.isChecked():
             gan_image_size = 256
@@ -1496,6 +1578,7 @@ class SettingsTab(QWidget):
             "expansion_method":   expand_method,
             "gan_image_size":     gan_image_size,
             "gan_batch_size":     self.spin_gan_batch.value(),
+            "sd_count":           self.settings.get("sd_count", 200),
         })
         _save_settings(self.settings)
         # Сигнал уже мог уйти при переключении radio — посылаем ещё раз для надёжности

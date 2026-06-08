@@ -59,6 +59,7 @@ STEP_NAMES = {
     "balance":          "Балансировка",
     "export":           "Экспорт датасета",
     "generate":         "Генерация (GAN)",
+    "generate_sd":      "Генерация SD фонов",
     "compose":          "Компоновка (Copy-Paste)",
     "extract_persons":  "Извлечение фигур",
 }
@@ -710,6 +711,7 @@ def _parse_args() -> argparse.Namespace:
             "  python main.py --project дрон --clean\n"
             "  python main.py --project дрон --clean --frames\n"
             "  python main.py --project дрон --clean --all-data\n"
+            "  python main.py --project bpla --generate-backgrounds --count 200\n"
         ),
     )
 
@@ -780,7 +782,10 @@ def _parse_args() -> argparse.Namespace:
     )
     grp_run.add_argument(
         "--count", type=int, default=200, metavar="N",
-        help="Количество кадров (с --generate или --compose, по умолчанию 200)",
+        help=(
+            "Количество кадров (с --generate, --generate-backgrounds "
+            "или --compose, по умолчанию 200)"
+        ),
     )
     grp_run.add_argument(
         "--extract-persons", action="store_true", dest="extract_persons",
@@ -789,6 +794,13 @@ def _parse_args() -> argparse.Namespace:
     grp_run.add_argument(
         "--compose", action="store_true",
         help="Создать синтетические кадры методом Copy-Paste (использует --count)",
+    )
+    grp_run.add_argument(
+        "--generate-backgrounds", action="store_true", dest="generate_backgrounds",
+        help=(
+            "Генерировать фоновые сцены через Stable Diffusion "
+            "(использует --count, по умолчанию 200)"
+        ),
     )
 
     # Группа управления источниками данных
@@ -833,7 +845,7 @@ def _parse_args() -> argparse.Namespace:
         any(getattr(args, s, False)
             for s in ["all", "load", "annotate", "augment", "balance", "export",
                       "clean", "train_gan", "generate",
-                      "extract_persons", "compose"])
+                      "extract_persons", "compose", "generate_backgrounds"])
         or bool(args.from_step)
         or bool(args.frames or args.processed or args.all_data)
         or bool(args.set_source)
@@ -1001,6 +1013,21 @@ def main() -> None:
         try:
             result = compose(project, count=args.count)
             print(f"Готово: создано {result['composed']} кадров.")
+        except (FileNotFoundError, Exception) as exc:
+            print(f"Ошибка: {exc}")
+            sys.exit(1)
+        return
+
+    if args.generate_backgrounds:
+        from modules.diffusion import generate_backgrounds
+        print(BANNER)
+        print(
+            f"\nГенерация SD фонов | проект: {project.name} | "
+            f"кадров: {args.count}"
+        )
+        try:
+            result = generate_backgrounds(project, count=args.count)
+            print(f"Готово: сгенерировано {result['generated']} фоновых сцен.")
         except (FileNotFoundError, Exception) as exc:
             print(f"Ошибка: {exc}")
             sys.exit(1)
