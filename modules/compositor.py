@@ -302,24 +302,34 @@ def compose(project: Project, count: int = 200) -> dict:
     Raises:
         FileNotFoundError: если нет негативных кадров или фигур людей.
     """
-    images_dir  = project.dataset_images_dir
-    labels_dir  = project.dataset_labels_dir
     persons_dir = project.persons_dir
     output_dir  = project.frames_real_dir
     # Аннотации comp_ кадров кладём туда же, куда annotator сохраняет real-разметку
     ann_dir = project.annotations_dir / "real"
 
+    # Выбираем источник фонов: dataset/ если balance уже запускался,
+    # иначе frames/real/ — там лежат SD-фоны до балансировки
+    _dataset_dir = project.dataset_images_dir
+    if _dataset_dir.exists() and any(_dataset_dir.iterdir()):
+        bg_frames_dir = _dataset_dir
+        bg_labels_dir = project.dataset_labels_dir
+        logger.info(f"Фоны берём из dataset: {bg_frames_dir}")
+    else:
+        bg_frames_dir = project.frames_real_dir
+        bg_labels_dir = project.annotations_dir / "real"
+        logger.info(f"dataset/ пуст — фоны берём из frames/real: {bg_frames_dir}")
+
     # Собираем негативные кадры (фоны) — пустые или отсутствующие аннотации.
     # sd_forest_ исключаем: в лесных сценах человек плохо различим,
     # используем только sd_open_ и обычные негативные кадры.
     backgrounds: List[Path] = []
-    if images_dir.exists():
-        for img_path in images_dir.iterdir():
+    if bg_frames_dir.exists():
+        for img_path in bg_frames_dir.iterdir():
             if img_path.suffix.lower() not in _IMG_EXTS:
                 continue
             if img_path.stem.startswith("sd_forest_"):
                 continue
-            label_path = labels_dir / (img_path.stem + ".txt")
+            label_path = bg_labels_dir / (img_path.stem + ".txt")
             if not label_path.exists():
                 backgrounds.append(img_path)
                 continue
@@ -328,8 +338,9 @@ def compose(project: Project, count: int = 200) -> dict:
 
     if not backgrounds:
         raise FileNotFoundError(
-            f"Негативные кадры (пустые аннотации) не найдены в {images_dir}.\n"
-            f"Для фонов нужны кадры без объектов. Сначала запустите balance."
+            f"Негативные кадры (пустые аннотации) не найдены.\n"
+            f"Проверено: {bg_frames_dir}\n"
+            f"Убедитесь что generate_sd выполнен или запустите balance."
         )
 
     # Собираем вырезанных людей
