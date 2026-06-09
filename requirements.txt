@@ -4,16 +4,14 @@
 # Установка:
 #   pip install -r requirements.txt
 #
-# PyTorch устанавливается отдельно (нужна версия с поддержкой CUDA):
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-#
-# Для CPU-only (без CUDA):
-#   pip install torch torchvision
+# PyTorch устанавливается отдельно — см. README
+# GPU (CUDA 12.1): pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# CPU: pip install torch torchvision
 # =============================================================================
 
 # Основные зависимости
 opencv-python>=4.10.0
-numpy>=2.0.0
+numpy==1.26.4
 Pillow>=10.0.0
 
 # Разметка и детекция
@@ -21,3 +19,10 @@ ultralytics>=8.0.0
 
 # GUI
 PyQt6>=6.7.0
+
+# Синтез и расширение данных (Stable Diffusion, DCGAN)
+diffusers==0.24.0
+transformers==4.36.0
+accelerate==0.25.0
+peft==0.7.0
+huggingface_hub==0.20.3

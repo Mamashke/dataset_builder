@@ -49,6 +49,11 @@
 ```
 main.py → project.py → loader.py → annotator.py → augmentor.py → balancer.py → exporter.py
            (изоляция)   (load)      (annotate)      (augment)      (balance)     (export)
+
+Дополнительные модули расширения датасета:
+main.py → generator.py  → train_gan / generate_images   (DCGAN-генерация фонов)
+        → diffusion.py  → generate_backgrounds           (SD-генерация фонов)
+        → compositor.py → extract_persons / compose      (Copy-Paste синтетика)
 ```
 
 ### `modules/project.py` — система проектов
@@ -159,6 +164,45 @@ dataset     → images, labels  (финальный датасет)
 
 ---
 
+### `modules/generator.py` — DCGAN-генерация синтетических сцен
+
+Реализует Deep Convolutional GAN для генерации негативных примеров (фоны без людей). Поддерживает разрешения 64×64, 128×128 и 256×256. Архитектура масштабируется автоматически через дополнительные блоки апсэмплинга/даунсэмплинга.
+
+| Функция | Описание |
+|---|---|
+| `train_gan(project, epochs, batch_size, image_size)` | Обучает генератор и дискриминатор на оригинальных кадрах проекта |
+| `generate_images(project, count)` | Генерирует кадры с помощью сохранённого `generator.pth` |
+
+Сохраняет веса в `gan_model/generator.pth` и `discriminator.pth`, сэмплы прогресса — в `gan_samples/epoch_NNNN.jpg`. Сгенерированные кадры записываются как `gan_NNNNNN.jpg` в `frames/real/`.
+
+---
+
+### `modules/diffusion.py` — генерация фонов через Stable Diffusion
+
+Генерирует реалистичные фоновые сцены с видом БПЛА (строго сверху вниз) с помощью модели `runwayml/stable-diffusion-v1-5`. Создаёт пустые аннотации — все сцены являются негативными примерами.
+
+| Тип | Префикс | Описание |
+|---|---|---|
+| `open` | `sd_open_` | Открытые пространства: луга, поля, просеки |
+| `forest` | `sd_forest_` | Лесные сцены разных сезонов |
+
+Compositor использует только `sd_open_` фоны — в открытых сценах силуэт человека хорошо различим. Изображения сохраняются в `frames/real/`, пустые аннотации — в `annotations/real/`.
+
+---
+
+### `modules/compositor.py` — Copy-Paste вставка людей с автоматической разметкой
+
+Вырезает фигуры людей из позитивных кадров датасета и вставляет их на негативные фоны, формируя синтетические позитивные примеры с автоматически сгенерированными YOLO-аннотациями.
+
+| Функция | Описание |
+|---|---|
+| `extract_persons(project)` | Вырезает bbox-регионы из позитивных кадров → `persons/`, записывает `metadata.json` |
+| `compose(project, count)` | Генерирует `count` синтетических кадров `comp_NNNNNN.jpg` с аннотациями |
+
+Подбирает человека по цвету фона (евклидово расстояние в BGR-пространстве). Применяет случайный поворот ±15°, масштаб 15–35 px (высота), яркость ±20%, alpha-blending с размытыми краями.
+
+---
+
 ## Установка
 
 ### Требования
@@ -170,17 +214,35 @@ dataset     → images, labels  (финальный датасет)
 pip install -r requirements.txt
 ```
 
-Содержимое `requirements.txt`:
-```
-opencv-python>=4.13.0
-```
-
 Для шага **авторазметки** дополнительно:
 ```bash
 pip install ultralytics
 ```
 
 При первом запуске `ultralytics` автоматически скачает веса `yolov8n.pt` (~6 МБ).
+
+### Установка PyTorch
+
+PyTorch требуется для DCGAN (`--train-gan`, `--generate`) и Stable Diffusion (`--generate-backgrounds`).
+
+```bash
+# GPU (CUDA 12.1) — рекомендуется:
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+# CPU (без GPU):
+pip install torch torchvision
+```
+
+### Установка Stable Diffusion
+
+Для использования генерации фонов через Stable Diffusion дополнительно установите:
+
+```bash
+pip install diffusers transformers accelerate peft
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+```
+
+При первом запуске `--generate-backgrounds` модель `runwayml/stable-diffusion-v1-5` (~4 ГБ) автоматически загрузится через Hugging Face Hub.
 
 ---
 
@@ -256,6 +318,61 @@ python main.py --project my_project --all --from balance
 | `--export --format coco` | Экспорт в формат COCO без интерактивного вопроса |
 
 Допустимые значения `--from`: `load`, `annotate`, `augment`, `balance`, `export`
+
+---
+
+### Расширение датасета
+
+Все команды требуют `--project НАЗВАНИЕ`.
+
+#### DCGAN
+
+| Флаг | Описание |
+|---|---|
+| `--train-gan` | Обучить DCGAN на оригинальных кадрах проекта |
+| `--train-gan --epochs N` | Количество эпох (по умолчанию 100) |
+| `--train-gan --batch-size N` | Размер батча (по умолчанию из config) |
+| `--train-gan --image-size N` | Разрешение обучения: 64, 128 или 256 |
+| `--generate --count N` | Сгенерировать N кадров с помощью обученного генератора |
+
+```bash
+# Обучить 150 эпох, разрешение 128×128
+python main.py --project дрон --train-gan --epochs 150 --image-size 128
+
+# Сгенерировать 500 синтетических кадров
+python main.py --project дрон --generate --count 500
+```
+
+#### Stable Diffusion
+
+| Флаг | Описание |
+|---|---|
+| `--generate-backgrounds` | Генерировать фоновые сцены через Stable Diffusion |
+| `--generate-backgrounds --count N` | Общее количество сцен (по умолчанию 200) |
+| `--generate-backgrounds --type open` | Только открытые пространства |
+| `--generate-backgrounds --type forest` | Только лесные сцены |
+| `--generate-backgrounds --type all` | Оба типа поровну (по умолчанию) |
+
+```bash
+# 200 сцен обоих типов
+python main.py --project дрон --generate-backgrounds --count 200
+
+# 100 только открытых
+python main.py --project дрон --generate-backgrounds --type open --count 100
+```
+
+#### Copy-Paste (compositor)
+
+| Флаг | Описание |
+|---|---|
+| `--extract-persons` | Вырезать фигуры людей из dataset/images/ → persons/ |
+| `--compose --count N` | Создать N синтетических позитивных кадров (по умолчанию 200) |
+
+```bash
+# Вырезать фигуры, затем скомпоновать 300 кадров
+python main.py --project дрон --extract-persons
+python main.py --project дрон --compose --count 300
+```
 
 **Примеры:**
 
@@ -348,6 +465,9 @@ dataset_builder/
 │   ├── augmentor.py     # Аугментация: туман, дождь, шум, размытие, яркость
 │   ├── balancer.py      # Фильтрация, балансировка, сборка датасета
 │   ├── exporter.py      # Экспорт в YOLO и COCO
+│   ├── generator.py     # DCGAN: обучение и генерация синтетических сцен
+│   ├── diffusion.py     # Stable Diffusion: генерация фоновых сцен
+│   ├── compositor.py    # Copy-Paste: вставка людей с автоматической разметкой
 │   └── logger.py        # Единая настройка логирования
 │
 ├── projects/            # Папки всех проектов (создаётся автоматически)
@@ -440,6 +560,63 @@ dataset_builder/
 **Параметр `intensity`** (0.0–1.0) управляет силой эффекта. Пайплайн запускает аугментацию с `intensity=0.5`.
 
 Аугментация увеличивает датасет в 6 раз: 1 оригинал + 5 вариантов. Кадры с суффиксом `_blur` намеренно исключены из проверки резкости в балансировщике.
+
+---
+
+## Методы расширения датасета
+
+Помимо классической аугментации, проект поддерживает три метода синтетического расширения:
+
+### Аугментация (augmentor.py)
+
+Трансформации пикселей без изменения геометрии — bbox аннотации копируются без изменений:
+
+| Метод | Суффикс | Имитирует |
+|---|---|---|
+| `fog` | `_fog` | Туман, дымку |
+| `rain` | `_rain` | Дождь с перспективой камеры БПЛА |
+| `noise` | `_noise` | Зернистость сенсора |
+| `blur` | `_blur` | Расфокус, тряску |
+| `brightness` | `_brightness` | Разные условия освещения |
+
+### DCGAN — генерация негативных примеров (generator.py)
+
+Обучается на оригинальных кадрах проекта, после чего генерирует синтетические фоны без людей. Используется для расширения негативной части датасета без ручного сбора данных.
+
+```bash
+# Обучить модель
+python main.py --project дрон --train-gan --epochs 100
+
+# Сгенерировать 200 кадров
+python main.py --project дрон --generate --count 200
+```
+
+### Stable Diffusion — реалистичные фоны (diffusion.py)
+
+Генерирует фотореалистичные аэросъёмочные сцены двух типов с помощью модели `runwayml/stable-diffusion-v1-5`:
+
+- **open** (`sd_open_*.jpg`) — открытые пространства: луга, поля, просеки
+- **forest** (`sd_forest_*.jpg`) — лесные сцены разных сезонов
+
+```bash
+# Оба типа (по 100 каждого)
+python main.py --project дрон --generate-backgrounds --count 200
+
+# Только открытые
+python main.py --project дрон --generate-backgrounds --type open --count 100
+```
+
+### Copy-Paste — синтетические позитивные примеры (compositor.py)
+
+Вырезает фигуры людей из реальных кадров и вставляет их на негативные фоны (в том числе сгенерированные через SD или GAN). Автоматически формирует YOLO-аннотации. Подбирает человека по цвету фона для естественного вида.
+
+```bash
+# Шаг 1: вырезать фигуры людей из датасета
+python main.py --project дрон --extract-persons
+
+# Шаг 2: создать 300 синтетических позитивных кадров
+python main.py --project дрон --compose --count 300
+```
 
 ---
 

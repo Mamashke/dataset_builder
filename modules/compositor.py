@@ -117,6 +117,89 @@ def _avg_person_height(metadata: list) -> Optional[float]:
     return sum(heights) / len(heights) if heights else None
 
 
+def _bg_color_around_bbox(
+    img: np.ndarray, x1: int, y1: int, x2: int, y2: int, pad: int = 5
+) -> List[int]:
+    """Считает средний BGR цвет фона вокруг bbox (полоса шириной pad пикселей).
+
+    Берёт четыре полосы за границей bbox (сверху, снизу, слева, справа),
+    объединяет все пиксели и возвращает средний цвет как [B, G, R].
+    Полосы автоматически обрезаются до границ изображения.
+    """
+    h, w = img.shape[:2]
+    strips = []
+
+    # Полоса сверху — от (y1-pad) до y1
+    r0, r1 = max(0, y1 - pad), y1
+    if r1 > r0 and x2 > x1:
+        strips.append(img[r0:r1, x1:x2])
+
+    # Полоса снизу — от y2 до (y2+pad)
+    r0, r1 = y2, min(h, y2 + pad)
+    if r1 > r0 and x2 > x1:
+        strips.append(img[r0:r1, x1:x2])
+
+    # Полоса слева — от (x1-pad) до x1
+    c0, c1 = max(0, x1 - pad), x1
+    if c1 > c0 and y2 > y1:
+        strips.append(img[y1:y2, c0:c1])
+
+    # Полоса справа — от x2 до (x2+pad)
+    c0, c1 = x2, min(w, x2 + pad)
+    if c1 > c0 and y2 > y1:
+        strips.append(img[y1:y2, c0:c1])
+
+    if not strips:
+        return [0, 0, 0]
+
+    # Объединяем пиксели всех полос и считаем среднее по каждому каналу
+    pixels = np.concatenate([s.reshape(-1, 3) for s in strips], axis=0)
+    mean   = pixels.mean(axis=0)
+    return [int(mean[0]), int(mean[1]), int(mean[2])]
+
+
+def _pick_person_by_color(
+    person_files: List[Path],
+    meta_by_name: dict,
+    bg_color: List[int],
+    top_k: int = 5,
+) -> Path:
+    """Выбирает человека из списка, чей цвет фона наиболее близок к bg_color.
+
+    Вычисляет евклидово расстояние в BGR-пространстве между bg_color и
+    bg_color из метаданных каждого человека. Берёт top_k ближайших и
+    возвращает случайного из них — разнообразие сохраняется, но цветовая
+    согласованность улучшается.
+
+    Если ни для одного человека нет bg_color в метаданных — возвращает
+    случайного из всего списка (обратная совместимость со старыми persons/).
+    """
+    # Отбираем только тех, для кого записан bg_color
+    with_color = [
+        p for p in person_files
+        if p.name in meta_by_name and "bg_color" in meta_by_name[p.name]
+    ]
+    if not with_color:
+        return random.choice(person_files)
+
+    bg = np.array(bg_color, dtype=np.float32)
+
+    # Считаем расстояние: sqrt((b1-b2)² + (g1-g2)² + (r1-r2)²)
+    distances = []
+    for p in with_color:
+        pc   = np.array(meta_by_name[p.name]["bg_color"], dtype=np.float32)
+        dist = float(np.linalg.norm(bg - pc))
+        distances.append((dist, p))
+
+    # Сортируем по расстоянию — ближайшие первые
+    distances.sort(key=lambda x: x[0])
+
+    # Берём топ-k и выбираем случайного — баланс между точностью и разнообразием
+    k    = min(top_k, len(distances))
+    top  = [p for _, p in distances[:k]]
+    return random.choice(top)
+
+
 # ---------------------------------------------------------------------------
 # Публичная функция: извлечение фигур людей
 # ---------------------------------------------------------------------------
@@ -188,6 +271,16 @@ def extract_persons(project: Project) -> List[Path]:
     for img_path in image_files:
         label_path = annotations_dir / (img_path.stem + ".txt")
 
+        # Пропускаем аугментированные и синтетические кадры — люди нужны только
+        # из оригинальных кадров, чтобы не дублировать одни и те же патчи
+        _stem = img_path.stem
+        if (_stem.endswith(("_fog", "_rain", "_noise", "_blur", "_brightness"))
+                or "_sd_" in _stem
+                or _stem.startswith("gan_")
+                or _stem.startswith("comp_")):
+            skipped += 1
+            continue
+
         # Первые 5 кадров — диагностика пути к аннотации
         if processed + skipped < 5:
             logger.info(
@@ -237,6 +330,13 @@ def extract_persons(project: Project) -> List[Path]:
             if x2 <= x1 or y2 <= y1:
                 continue
 
+            patch_h = y2 - y1
+            patch_w = x2 - x1
+
+            # Пропускаем слишком мелкие патчи — нет смысла вырезать нечитаемые пиксели
+            if patch_h < 8 or patch_w < 5:
+                continue
+
             crop = img[y1:y2, x1:x2]
             if crop.size == 0:
                 continue
@@ -245,10 +345,14 @@ def extract_persons(project: Project) -> List[Path]:
             out_path = persons_dir / out_name
             if _write_image(out_path, crop):
                 saved_paths.append(out_path)
-                # Запоминаем оригинальную высоту bbox для нормализации масштаба в compose()
+                # Средний цвет фона вокруг bbox — для подбора людей по цвету в compose()
+                bg_color = _bg_color_around_bbox(img, x1, y1, x2, y2)
                 metadata.append({
-                    "filename": out_name,
-                    "original_height_px": y2 - y1,
+                    "filename":           out_name,
+                    "original_height_px": patch_h,
+                    "patch_h":            patch_h,
+                    "patch_w":            patch_w,
+                    "bg_color":           bg_color,
                 })
                 extracted += 1
 
@@ -360,7 +464,7 @@ def compose(project: Project, count: int = 200) -> dict:
             f"Сначала запустите: --extract-persons"
         )
 
-    # Загружаем метаданные для нормализации масштаба
+    # Загружаем метаданные для нормализации масштаба и подбора по цвету
     metadata   = _load_metadata(persons_dir)
     avg_height = _avg_person_height(metadata)
     if avg_height is not None:
@@ -374,6 +478,13 @@ def compose(project: Project, count: int = 200) -> dict:
         logger.warning(
             "metadata.json не найден, масштаб будет случайным в диапазоне 10–30 px"
         )
+
+    # Индекс метаданных по имени файла — для быстрого поиска bg_color в цикле
+    meta_by_name = {m["filename"]: m for m in metadata}
+    has_color = sum(1 for m in metadata if "bg_color" in m)
+    logger.info(
+        f"Метаданные цвета: {has_color}/{len(metadata)} фигур имеют bg_color"
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     ann_dir.mkdir(parents=True, exist_ok=True)
@@ -412,12 +523,21 @@ def compose(project: Project, count: int = 200) -> dict:
 
         bg_h, bg_w = bg.shape[:2]
 
+        # Средний BGR цвет всего фонового кадра — основа для подбора человека
+        bg_mean_color = [
+            int(bg[:, :, 0].mean()),  # B
+            int(bg[:, :, 1].mean()),  # G
+            int(bg[:, :, 2].mean()),  # R
+        ]
+
         yolo_lines: List[str] = []
 
         # Вставляем 1–3 человека на один кадр
         n_persons = random.randint(1, 3)
         for _ in range(n_persons):
-            person = _read_image(random.choice(person_files))
+            # Подбираем человека чей исходный фон близок по цвету к текущему фону
+            chosen_path = _pick_person_by_color(person_files, meta_by_name, bg_mean_color)
+            person = _read_image(chosen_path)
             if person is None:
                 continue
 
@@ -425,19 +545,19 @@ def compose(project: Project, count: int = 200) -> dict:
             if p_h_orig == 0 or p_w_orig == 0:
                 continue
 
-            # Целевая высота: avg из metadata ±20%, иначе случайно 10–30 px
-            if avg_height is not None:
-                variation = random.uniform(
-                    1.0 - _SCALE_VARIATION,
-                    1.0 + _SCALE_VARIATION,
-                )
-                target_h = max(1, int(avg_height * variation))
-            else:
-                target_h = random.randint(10, 30)
-            scale    = target_h / p_h_orig
-            target_w = max(1, int(p_w_orig * scale))
+            # Берём оригинальный размер патча из metadata — он точнее чем shape
+            # загруженного JPEG (тот мог быть пересохранён с потерями)
+            meta_entry = meta_by_name.get(chosen_path.name, {})
+            patch_h = meta_entry.get("patch_h", p_h_orig)
+            patch_w = meta_entry.get("patch_w", p_w_orig)
+
+            # Всегда масштабируем патч вниз до TARGET_HEIGHT — реалистичный размер
+            # человека на кадре 640×640 с дроновой высоты (15–35 px)
+            target_h = random.randint(15, 35)
+            scale    = target_h / patch_h
+            new_w    = max(1, int(patch_w * scale))
             person   = cv2.resize(
-                person, (target_w, target_h), interpolation=cv2.INTER_AREA
+                person, (new_w, target_h), interpolation=cv2.INTER_AREA
             )
 
             # Случайный поворот -15..+15 градусов
