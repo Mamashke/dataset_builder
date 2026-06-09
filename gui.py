@@ -45,14 +45,15 @@ _PIPELINE_STEPS_GAN     = ["load", "annotate", "generate",    "balance", "export
 _PIPELINE_STEPS_SD      = ["load", "annotate", "generate_sd", "compose", "balance", "export"]
 
 STEP_NAMES = {
-    "load":        "Загрузка видео",
-    "annotate":    "Разметка кадров",
-    "augment":     "Аугментация",
-    "generate":    "Генерация (GAN)",
-    "generate_sd": "Генерация SD фонов",
-    "compose":     "Copy-Paste компоновка",
-    "balance":     "Балансировка",
-    "export":      "Экспорт датасета",
+    "load":             "Загрузка видео",
+    "annotate":         "Разметка кадров",
+    "augment":          "Аугментация",
+    "generate":         "Генерация (GAN)",
+    "generate_sd":      "Генерация SD фонов",
+    "extract_persons":  "Извлечь людей",
+    "compose":          "Copy-Paste компоновка",
+    "balance":          "Балансировка",
+    "export":           "Экспорт датасета",
 }
 
 # Папки, очищаемые на каждом уровне
@@ -316,8 +317,26 @@ class PipelineWorker(QThread):
                         background_type=self.sd_bg_type,
                     )
 
+                elif step == "extract_persons":
+                    from modules.compositor import extract_persons
+                    saved = extract_persons(self.project)
+                    results["extract_persons"] = {"count": len(saved)}
+
                 elif step == "compose":
-                    from modules.compositor import compose as do_compose
+                    from modules.compositor import compose as do_compose, extract_persons as _extract
+                    # Если папка с людьми пуста — автоматически извлекаем перед компоновкой
+                    persons_dir = self.project.persons_dir
+                    _img_exts = {".jpg", ".jpeg", ".png"}
+                    _person_files = (
+                        [p for p in persons_dir.iterdir() if p.suffix.lower() in _img_exts]
+                        if persons_dir.exists() else []
+                    )
+                    if not _person_files:
+                        import logging as _logging
+                        _logging.getLogger(__name__).info(
+                            "persons_dir пуста — автоматически запускаем extract_persons"
+                        )
+                        _extract(self.project)
                     results["compose"] = do_compose(
                         self.project, count=self.sd_count
                     )
@@ -894,7 +913,7 @@ class PipelineTab(QWidget):
         self.step_btns: dict[str, QPushButton] = {}
         _all_step_keys = [
             "load", "annotate", "augment",
-            "generate", "generate_sd", "compose",
+            "generate", "generate_sd", "extract_persons", "compose",
             "balance", "export",
         ]
         for step in _all_step_keys:
@@ -1292,6 +1311,13 @@ class PipelineTab(QWidget):
         self._set_running(False, f"Готово. Выполнено шагов: {n}.")
         self.set_project(self.current_project)
         self.pipeline_done.emit()
+        # Показываем сколько людей извлечено, если выполнялся шаг extract_persons
+        if "extract_persons" in results:
+            count = results["extract_persons"].get("count", 0)
+            QMessageBox.information(
+                self, "Извлечение людей",
+                f"Извлечено фигур людей: {count}"
+            )
 
     def _on_error(self, msg: str) -> None:
         self._set_running(False, "")
