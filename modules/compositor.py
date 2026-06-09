@@ -307,17 +307,20 @@ def compose(project: Project, count: int = 200) -> dict:
     # Аннотации comp_ кадров кладём туда же, куда annotator сохраняет real-разметку
     ann_dir = project.annotations_dir / "real"
 
-    # Выбираем источник фонов: dataset/ если balance уже запускался,
-    # иначе frames/real/ — там лежат SD-фоны до балансировки
+    # Выбираем источник фонов.
+    # frames/real/ — приоритет: туда пишут generate_sd, load и augment.
+    # dataset/images/ — запасной: используется если frames/real/ пуст
+    # (например, пользователь запускает compose отдельно после полного pipeline).
+    _frames_dir = project.frames_real_dir
     _dataset_dir = project.dataset_images_dir
-    if _dataset_dir.exists() and any(_dataset_dir.iterdir()):
+    if _frames_dir.exists() and any(_frames_dir.iterdir()):
+        bg_frames_dir = _frames_dir
+        bg_labels_dir = project.annotations_dir / "real"
+        logger.info(f"Фоны берём из frames/real: {bg_frames_dir}")
+    else:
         bg_frames_dir = _dataset_dir
         bg_labels_dir = project.dataset_labels_dir
-        logger.info(f"Фоны берём из dataset: {bg_frames_dir}")
-    else:
-        bg_frames_dir = project.frames_real_dir
-        bg_labels_dir = project.annotations_dir / "real"
-        logger.info(f"dataset/ пуст — фоны берём из frames/real: {bg_frames_dir}")
+        logger.info(f"frames/real/ пуст — фоны берём из dataset: {bg_frames_dir}")
 
     # Собираем негативные кадры (фоны) — пустые или отсутствующие аннотации.
     # sd_forest_ исключаем: в лесных сценах человек плохо различим,
