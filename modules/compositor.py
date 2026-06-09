@@ -124,10 +124,10 @@ def _avg_person_height(metadata: list) -> Optional[float]:
 def extract_persons(project: Project) -> List[Path]:
     """Вырезает прямоугольники с людьми из позитивных кадров датасета.
 
-    Для каждого изображения из dataset/images/ читает соответствующий
-    файл разметки из dataset/labels/. Кадры без аннотаций (негативные)
-    и пустые файлы пропускаются. Для каждой bbox вырезает регион и
-    сохраняет в project.persons_dir.
+    Источники данных определяются через data_sources проекта (приоритет),
+    с fallback на стандартные папки проекта, и в крайнем случае — на dataset/.
+    Кадры без аннотаций (негативные) и пустые файлы пропускаются.
+    Для каждой bbox вырезает регион и сохраняет в project.persons_dir.
 
     Дополнительно записывает persons/metadata.json с оригинальной высотой
     каждой вырезанной фигуры — используется в compose() для нормализации масштаба.
@@ -139,24 +139,39 @@ def extract_persons(project: Project) -> List[Path]:
         Список путей к сохранённым вырезанным фигурам.
 
     Raises:
-        FileNotFoundError: если dataset_images_dir не существует или пуста.
+        FileNotFoundError: если не найдена ни одна папка с изображениями.
     """
-    images_dir  = project.dataset_images_dir
-    labels_dir  = project.dataset_labels_dir
     persons_dir = project.persons_dir
 
-    if not images_dir.exists() or not any(images_dir.iterdir()):
+    # Кадры — приоритет data_sources, fallback на папку проекта
+    frames_dir = project.get_source("frames", "real") or project.frames_real_dir
+
+    # Аннотации — приоритет data_sources, fallback на папку проекта
+    annotations_dir = (
+        project.get_source("annotations", "real")
+        or (project.annotations_dir / "real")
+    )
+
+    # Если из data_sources/проекта данных нет — берём готовый датасет
+    if not frames_dir.exists() or not any(frames_dir.iterdir()):
+        frames_dir      = project.dataset_images_dir
+        annotations_dir = project.dataset_labels_dir
+
+    logger.info(f"Кадры: {frames_dir}")
+    logger.info(f"Аннотации: {annotations_dir}")
+
+    if not frames_dir.exists() or not any(frames_dir.iterdir()):
         raise FileNotFoundError(
-            f"Папка с изображениями датасета не найдена или пуста: {images_dir}\n"
-            f"Сначала запустите шаг balance."
+            f"Папка с кадрами не найдена или пуста: {frames_dir}\n"
+            f"Проверьте data_sources проекта или запустите шаг balance."
         )
 
     persons_dir.mkdir(parents=True, exist_ok=True)
 
-    # Собираем все изображения датасета
-    image_files = [p for p in images_dir.iterdir() if p.suffix.lower() in _IMG_EXTS]
+    # Собираем все изображения из выбранной папки
+    image_files = [p for p in frames_dir.iterdir() if p.suffix.lower() in _IMG_EXTS]
     if not image_files:
-        raise FileNotFoundError(f"Изображения не найдены в {images_dir}")
+        raise FileNotFoundError(f"Изображения не найдены в {frames_dir}")
 
     logger.info(
         f"extract_persons | проект={project.name} | "
@@ -171,7 +186,7 @@ def extract_persons(project: Project) -> List[Path]:
     processed = 0   # кадры, дошедшие до разбора bbox (не пропущенные)
 
     for img_path in image_files:
-        label_path = labels_dir / (img_path.stem + ".txt")
+        label_path = annotations_dir / (img_path.stem + ".txt")
 
         # Первые 5 кадров — диагностика пути к аннотации
         if processed + skipped < 5:
