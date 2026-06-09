@@ -168,9 +168,18 @@ def extract_persons(project: Project) -> List[Path]:
     metadata: list = []
     extracted = 0
     skipped   = 0
+    processed = 0   # кадры, дошедшие до разбора bbox (не пропущенные)
 
     for img_path in image_files:
         label_path = labels_dir / (img_path.stem + ".txt")
+
+        # Первые 5 кадров — диагностика пути к аннотации
+        if processed + skipped < 5:
+            logger.info(
+                f"Кадр: {img_path.name} | "
+                f"Ищу аннотацию: {label_path} | "
+                f"Существует: {label_path.exists()}"
+            )
 
         # Пропускаем негативные кадры (нет аннотации или пустой файл)
         if not label_path.exists():
@@ -188,6 +197,7 @@ def extract_persons(project: Project) -> List[Path]:
             continue
 
         h, w = img.shape[:2]
+        processed += 1   # кадр прошёл все проверки, идём разбирать bbox
 
         # Парсим YOLO-аннотации: class x_c y_c w_n h_n (нормализованные)
         for obj_idx, line in enumerate(content.splitlines()):
